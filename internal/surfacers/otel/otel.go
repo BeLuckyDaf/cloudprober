@@ -58,6 +58,9 @@ type OtelSurfacer struct {
 	scopeMetrics map[string]*metricdata.ScopeMetrics
 
 	startTime time.Time
+	provider  *metric.MeterProvider
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func getExporter(ctx context.Context, config *configpb.SurfacerConf, l *logger.Logger) (metric.Exporter, error) {
@@ -133,6 +136,9 @@ func getExporter(ctx context.Context, config *configpb.SurfacerConf, l *logger.L
 // goroutine to process both the incoming EventMetrics and the web requests for
 // the URL handler /metrics.
 func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Options, l *logger.Logger) (*OtelSurfacer, error) {
+	if config.GetExportIntervalSec() <= 0 {
+		return nil, fmt.Errorf("invalid otel surfacer buffer, batch size, or export interval")
+	}
 	if config == nil {
 		config = &configpb.SurfacerConf{}
 	}
@@ -161,16 +167,36 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 	}
 	res, err := resource.New(ctx, resource.WithHost(), resource.WithFromEnv(), resource.WithAttributes(attrKVs...))
 	if err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		r.Shutdown(shutdownCtx)
 		return nil, fmt.Errorf("failed to create resource: %v", err)
 	}
 
 	// This step registers the reader and pipelines behind the scene.
 	// manugarg: This step seems kind of unnecessary right now but it's
 	// required.
-	metric.NewMeterProvider(metric.WithReader(r), metric.WithResource(res))
+	os.provider = metric.NewMeterProvider(metric.WithReader(r), metric.WithResource(res))
+	context.AfterFunc(ctx, func() {
+		if err := os.Close(); err != nil {
+			l.Warningf("Error shutting down opentelemetry surfacer: %v", err)
+		}
+	})
 
 	l.Infof("Initialized opentelemetry surfacer with config: %s", config.String())
 	return os, nil
+}
+
+// Close flushes pending metrics and releases the exporter connection.
+func (os *OtelSurfacer) Close() error {
+	os.closeOnce.Do(func() {
+		if os.provider != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			os.closeErr = os.provider.Shutdown(ctx)
+		}
+	})
+	return os.closeErr
 }
 
 func (os *OtelSurfacer) Produce(_ context.Context) ([]metricdata.ScopeMetrics, error) {

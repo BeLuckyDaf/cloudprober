@@ -58,6 +58,7 @@ type Lameducker interface {
 var global struct {
 	mu     sync.RWMutex
 	lister endpoint.Lister
+	cancel context.CancelFunc
 }
 
 // service provides methods to do lameduck operations on VMs.
@@ -136,7 +137,7 @@ func (li *lister) newRDSServer() (*server.Server, error) {
 	}
 
 	pc := gcp.DefaultProviderConfig([]string{li.project}, resTypes, int(li.opts.GetReEvalSec()), "")
-	return server.New(context.Background(), &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{pc}}, nil, li.l)
+	return server.New(li.ctx, &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{pc}}, nil, li.l)
 }
 
 func (li *lister) rdsClient(baseResourcePath string, additionalFilter *rdspb.Filter) (*rdsclient.Client, error) {
@@ -159,7 +160,7 @@ func (li *lister) rdsClient(baseResourcePath string, additionalFilter *rdspb.Fil
 		rdsClientConf.Request.Filter = append(rdsClientConf.Request.Filter, additionalFilter)
 	}
 
-	return rdsclient.New(rdsClientConf, li.listResourcesFunc, li.l)
+	return rdsclient.NewWithContext(li.ctx, rdsClientConf, li.listResourcesFunc, li.l)
 }
 
 func (li *lister) initClients() error {
@@ -211,6 +212,7 @@ func (li *lister) ListEndpoints() []endpoint.Endpoint {
 }
 
 type lister struct {
+	ctx               context.Context
 	opts              *configpb.Options
 	project           string
 	rtcConfig         string
@@ -221,9 +223,10 @@ type lister struct {
 	l                 *logger.Logger
 }
 
-func newLister(globalOpts *targetspb.GlobalTargetsOptions, l *logger.Logger) (*lister, error) {
+func newLister(ctx context.Context, globalOpts *targetspb.GlobalTargetsOptions, l *logger.Logger) (*lister, error) {
 	opts := globalOpts.GetLameDuckOptions()
 	li := &lister{
+		ctx:           ctx,
 		opts:          opts,
 		rdsServerOpts: globalOpts.GetRdsServerOptions(),
 		rtcConfig:     opts.GetRuntimeconfigName(),
@@ -266,6 +269,11 @@ func newLister(globalOpts *targetspb.GlobalTargetsOptions, l *logger.Logger) (*l
 // is set to that service. Initiating the package from a given lister is useful
 // for testing pacakges that depend on this package.
 func InitDefaultLister(globalOpts *targetspb.GlobalTargetsOptions, lister endpoint.Lister, l *logger.Logger) error {
+	return InitDefaultListerWithContext(context.Background(), globalOpts, lister, l)
+}
+
+// InitDefaultListerWithContext initializes a lister tied to this runtime.
+func InitDefaultListerWithContext(ctx context.Context, globalOpts *targetspb.GlobalTargetsOptions, lister endpoint.Lister, l *logger.Logger) error {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 
@@ -284,11 +292,14 @@ func InitDefaultLister(globalOpts *targetspb.GlobalTargetsOptions, lister endpoi
 		l.Warning("lameduck: use_rds doesn't do anything anymore and will soon be removed.")
 	}
 
-	lister, err := newLister(globalOpts, l)
+	ctx, cancel := context.WithCancel(ctx)
+	lister, err := newLister(ctx, globalOpts, l)
 	if err != nil {
+		cancel()
 		return err
 	}
 
+	global.cancel = cancel
 	global.lister = lister
 	return nil
 }
@@ -302,4 +313,16 @@ func GetDefaultLister() (endpoint.Lister, error) {
 		return nil, errors.New("global lameduck service not initialized")
 	}
 	return global.lister, nil
+}
+
+// ResetRuntime stops the default lister and allows new lameduck options to take
+// effect when a configuration is reloaded.
+func ResetRuntime() {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if global.cancel != nil {
+		global.cancel()
+	}
+	global.cancel = nil
+	global.lister = nil
 }

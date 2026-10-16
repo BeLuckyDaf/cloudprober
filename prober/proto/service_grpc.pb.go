@@ -24,6 +24,7 @@ const (
 	Cloudprober_RunProbe_FullMethodName         = "/cloudprober.Cloudprober/RunProbe"
 	Cloudprober_ListProbes_FullMethodName       = "/cloudprober.Cloudprober/ListProbes"
 	Cloudprober_SaveProbesConfig_FullMethodName = "/cloudprober.Cloudprober/SaveProbesConfig"
+	Cloudprober_ReloadConfig_FullMethodName     = "/cloudprober.Cloudprober/ReloadConfig"
 	Cloudprober_GetProbeStatus_FullMethodName   = "/cloudprober.Cloudprober/GetProbeStatus"
 )
 
@@ -42,6 +43,9 @@ type CloudproberClient interface {
 	// ListProbes lists active probes.
 	ListProbes(ctx context.Context, in *ListProbesRequest, opts ...grpc.CallOption) (*ListProbesResponse, error)
 	SaveProbesConfig(ctx context.Context, in *SaveProbesConfigRequest, opts ...grpc.CallOption) (*SaveProbesConfigResponse, error)
+	// ReloadConfig rereads the original config source and applies the updated
+	// configuration without restarting the process.
+	ReloadConfig(ctx context.Context, in *ReloadConfigRequest, opts ...grpc.CallOption) (*ReloadConfigResponse, error)
 	// GetProbeStatus returns the ongoing probe status data, including
 	// total/success counters per probe/target.
 	GetProbeStatus(ctx context.Context, in *GetProbeStatusRequest, opts ...grpc.CallOption) (*GetProbeStatusResponse, error)
@@ -105,6 +109,16 @@ func (c *cloudproberClient) SaveProbesConfig(ctx context.Context, in *SaveProbes
 	return out, nil
 }
 
+func (c *cloudproberClient) ReloadConfig(ctx context.Context, in *ReloadConfigRequest, opts ...grpc.CallOption) (*ReloadConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReloadConfigResponse)
+	err := c.cc.Invoke(ctx, Cloudprober_ReloadConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *cloudproberClient) GetProbeStatus(ctx context.Context, in *GetProbeStatusRequest, opts ...grpc.CallOption) (*GetProbeStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetProbeStatusResponse)
@@ -130,6 +144,9 @@ type CloudproberServer interface {
 	// ListProbes lists active probes.
 	ListProbes(context.Context, *ListProbesRequest) (*ListProbesResponse, error)
 	SaveProbesConfig(context.Context, *SaveProbesConfigRequest) (*SaveProbesConfigResponse, error)
+	// ReloadConfig rereads the original config source and applies the updated
+	// configuration without restarting the process.
+	ReloadConfig(context.Context, *ReloadConfigRequest) (*ReloadConfigResponse, error)
 	// GetProbeStatus returns the ongoing probe status data, including
 	// total/success counters per probe/target.
 	GetProbeStatus(context.Context, *GetProbeStatusRequest) (*GetProbeStatusResponse, error)
@@ -157,6 +174,9 @@ func (UnimplementedCloudproberServer) ListProbes(context.Context, *ListProbesReq
 }
 func (UnimplementedCloudproberServer) SaveProbesConfig(context.Context, *SaveProbesConfigRequest) (*SaveProbesConfigResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SaveProbesConfig not implemented")
+}
+func (UnimplementedCloudproberServer) ReloadConfig(context.Context, *ReloadConfigRequest) (*ReloadConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReloadConfig not implemented")
 }
 func (UnimplementedCloudproberServer) GetProbeStatus(context.Context, *GetProbeStatusRequest) (*GetProbeStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProbeStatus not implemented")
@@ -272,6 +292,24 @@ func _Cloudprober_SaveProbesConfig_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Cloudprober_ReloadConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReloadConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CloudproberServer).ReloadConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Cloudprober_ReloadConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CloudproberServer).ReloadConfig(ctx, req.(*ReloadConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Cloudprober_GetProbeStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetProbeStatusRequest)
 	if err := dec(in); err != nil {
@@ -316,6 +354,10 @@ var Cloudprober_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SaveProbesConfig",
 			Handler:    _Cloudprober_SaveProbesConfig_Handler,
+		},
+		{
+			MethodName: "ReloadConfig",
+			Handler:    _Cloudprober_ReloadConfig_Handler,
 		},
 		{
 			MethodName: "GetProbeStatus",

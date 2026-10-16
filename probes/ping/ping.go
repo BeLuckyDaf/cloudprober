@@ -54,6 +54,7 @@ import (
 	"github.com/cloudprober/cloudprober/internal/validators/integrity"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
+	"github.com/cloudprober/cloudprober/probes/common/sched"
 	"github.com/cloudprober/cloudprober/probes/options"
 	configpb "github.com/cloudprober/cloudprober/probes/ping/proto"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
@@ -283,6 +284,11 @@ func matchPacket(runID, pktID, pktSeq uint16, datagramSocket bool) bool {
 }
 
 func (p *Probe) sendPackets(runID uint16, tracker chan bool) {
+	p.sendPacketsContext(context.Background(), runID, tracker)
+}
+
+func (p *Probe) sendPacketsContext(ctx context.Context, runID uint16, tracker chan bool) {
+	defer close(tracker)
 	seq := runID & uint16(0xff00)
 	packetsSent := int32(0)
 
@@ -292,6 +298,9 @@ func (p *Probe) sendPackets(runID uint16, tracker chan bool) {
 
 	for {
 		for _, target := range p.targets {
+			if ctx.Err() != nil {
+				return
+			}
 			p.results[target.Name].sent++
 
 			if p.target2addr[target.Name] == nil {
@@ -308,7 +317,9 @@ func (p *Probe) sendPackets(runID uint16, tracker chan bool) {
 			tracker <- true
 			// Sleep between pushing packets to avoid network buffer overflow
 			// in case of larger number of targets.
-			time.Sleep(1 * time.Millisecond)
+			if !sched.WaitContext(ctx, time.Millisecond) {
+				return
+			}
 		}
 
 		packetsSent++
@@ -316,9 +327,10 @@ func (p *Probe) sendPackets(runID uint16, tracker chan bool) {
 			break
 		}
 		seq++
-		time.Sleep(time.Duration(p.c.GetPacketsIntervalMsec()) * time.Millisecond)
+		if !sched.WaitContext(ctx, time.Duration(p.c.GetPacketsIntervalMsec())*time.Millisecond) {
+			return
+		}
 	}
-	close(tracker)
 }
 
 type rcvdPkt struct {
@@ -361,6 +373,9 @@ func (p *Probe) recvPackets(runID uint16, tracker chan bool) {
 		pktLen, peer, recvTime, err := p.conn.read(pktbuf)
 
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if !p.opts.NegativeTest {
 				p.l.Warning(err.Error())
 			}
@@ -494,7 +509,9 @@ func (p *Probe) newRunID() uint16 {
 //   - Get a new run ID.
 //   - Starts a goroutine to receive packets.
 //   - Send packets.
-func (p *Probe) runProbe() {
+func (p *Probe) runProbe() { p.runProbeContext(context.Background()) }
+
+func (p *Probe) runProbeContext(ctx context.Context) {
 	// Resolve targets if target resolve interval has elapsed.
 	if (p.runCnt % uint64(p.c.GetResolveTargetsInterval())) == 0 {
 		p.updateTargets()
@@ -508,7 +525,7 @@ func (p *Probe) runProbe() {
 		defer wg.Done()
 		p.recvPackets(runID, tracker)
 	}()
-	p.sendPackets(runID, tracker)
+	p.sendPacketsContext(ctx, runID, tracker)
 	wg.Wait()
 }
 
@@ -523,7 +540,13 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 	ticker := time.NewTicker(p.opts.Interval)
 	defer ticker.Stop()
 
-	for ts := range ticker.C {
+	for {
+		var ts time.Time
+		select {
+		case <-ctx.Done():
+			return
+		case ts = <-ticker.C:
+		}
 		// Don't run another probe if context is canceled already.
 		select {
 		case <-ctx.Done():
@@ -536,7 +559,7 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 		}
 
 		p.l.Debugf("Probe started, runcount %d", p.runCnt)
-		p.runProbe()
+		p.runProbeContext(ctx)
 		p.l.Debugf("Probe finished, runcount %d", p.runCnt)
 		if (p.runCnt % uint64(p.statsExportFreq)) != 0 {
 			continue
@@ -564,4 +587,12 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			p.opts.RecordMetrics(target, em, dataChan)
 		}
 	}
+}
+
+// Close releases resources acquired during initialization and unblocks active I/O.
+func (p *Probe) Close() error {
+	if p.conn != nil {
+		p.conn.close()
+	}
+	return nil
 }

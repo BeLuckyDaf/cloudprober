@@ -32,6 +32,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,8 +41,11 @@ import (
 	"github.com/cloudprober/cloudprober/common/tlsconfig"
 	"github.com/cloudprober/cloudprober/config"
 	configpb "github.com/cloudprober/cloudprober/config/proto"
+	"github.com/cloudprober/cloudprober/internal/alerting"
 	"github.com/cloudprober/cloudprober/internal/reaper"
 	"github.com/cloudprober/cloudprober/internal/servers"
+	serverspb "github.com/cloudprober/cloudprober/internal/servers/proto"
+	filesurfacer "github.com/cloudprober/cloudprober/internal/surfacers/file"
 	"github.com/cloudprober/cloudprober/internal/sysvars"
 	"github.com/cloudprober/cloudprober/internal/tracing"
 	"github.com/cloudprober/cloudprober/logger"
@@ -53,11 +57,17 @@ import (
 	system_configpb "github.com/cloudprober/cloudprober/probes/system/proto"
 	"github.com/cloudprober/cloudprober/state"
 	"github.com/cloudprober/cloudprober/surfacers"
+	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/web"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/channelz/service"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -99,7 +109,18 @@ type instance struct {
 	cancelStartCtx  context.CancelFunc
 	cancelInitCtx   context.CancelFunc
 	tracingShutdown tracing.ShutdownFunc
+	grpcSrv         *grpc.Server
+	customGRPC      bool
+	rawConfig       string
+	parsedConfig    string
+	lifetimeCtx     context.Context
+	cancelLifetime  context.CancelFunc
+	stopWatch       func() bool
 }
+
+// lifecycleMu serializes initialization, reload, and shutdown without blocking
+// config readers while workers finish or exporters flush.
+var lifecycleMu sync.Mutex
 
 // Global prober.Prober instance protected by a mutex. Cloudprober is a
 // process-wide singleton: it's initialized once and, once shut down, stays
@@ -243,17 +264,12 @@ func Init() error {
 }
 
 func InitWithConfigSource(configSrc config.ConfigSource) error {
-	if err := initWithConfigSource(configSrc); err != nil {
-		return err
-	}
-	return web.InitWithDataFuncs(web.DataFuncs{
-		GetRawConfig:    GetRawConfig,
-		GetParsedConfig: GetParsedConfig,
-		GetInfo:         GetInfo,
-	})
+	return initWithConfigSource(configSrc)
 }
 
 func initWithConfigSource(configSrc config.ConfigSource) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	cloudProber.Lock()
 	defer cloudProber.Unlock()
 
@@ -272,6 +288,27 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 	if err != nil {
 		return err
 	}
+
+	managedGRPC := state.DefaultGRPCServer() == nil
+	inst, err := newInstance(configSrc, withSystemProbe(cfg), false)
+	if err != nil {
+		if managedGRPC {
+			state.ResetRuntime()
+			targets.ResetRuntime()
+		}
+		return err
+	}
+	cloudProber.instance = inst
+	return nil
+}
+
+// withSystemProbe applies startup defaults to a newly read configuration.
+// Rollback uses the actual retired probe set and must not add removed probes.
+func withSystemProbe(cfg *configpb.ProberConfig) *configpb.ProberConfig {
+	if cfg == nil {
+		return nil
+	}
+	cfg = proto.Clone(cfg).(*configpb.ProberConfig)
 
 	if runtime.GOOS == "linux" {
 		// Be careful about imports, we want to check if system probe is configured.
@@ -298,6 +335,34 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 		}
 	}
 
+	return cfg
+}
+
+// newInstance acquires a complete runtime. Its caller serializes access to the
+// process-wide module registries and stops the previous runtime first.
+func newInstance(configSrc config.ConfigSource, cfg *configpb.ProberConfig, reloading bool) (instance, error) {
+	if cfg == nil {
+		return instance{}, errors.New("configuration is nil")
+	}
+	cfg = proto.Clone(cfg).(*configpb.ProberConfig)
+	if err := proto.CheckInitialized(cfg); err != nil {
+		return instance{}, err
+	}
+	if cfg.GetSysvarsIntervalMsec() <= 0 {
+		return instance{}, errors.New("sysvars_interval_msec must be positive")
+	}
+	// RegisterService terminates the process on duplicate services. Reject
+	// duplicate use of the default gRPC probe-target service before registration.
+	sharedGRPC := false
+	for _, server := range cfg.GetServer() {
+		if server.GetType() == serverspb.ServerDef_GRPC && !server.GetGrpcServer().GetUseDedicatedServer() {
+			if sharedGRPC {
+				return instance{}, errors.New("only one gRPC target server may use the default gRPC server")
+			}
+			sharedGRPC = true
+		}
+	}
+
 	globalLogger := logger.NewWithAttrs(slog.String("component", "global"))
 
 	// cleanup accumulates rollback actions for resources acquired below, run
@@ -314,7 +379,7 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 	// prometheus exporter.
 	ln, err := initDefaultServer(cfg, globalLogger)
 	if err != nil {
-		return err
+		return instance{}, err
 	}
 	cleanup = append(cleanup, func() { ln.Close() })
 	srvMux := http.NewServeMux()
@@ -322,16 +387,20 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 	state.SetDefaultHTTPServeMux(srvMux)
 
 	// Start default gRPC server (if configured - result may be nil).
+	customGRPC := state.DefaultGRPCServer() != nil
 	grpcLn, err := initDefaultGRPCServer(cfg)
 	if err != nil {
-		return err
+		return instance{}, err
 	}
 	if grpcLn != nil {
 		cleanup = append(cleanup, func() { grpcLn.Close() })
 	}
+	if grpcSrv := state.DefaultGRPCServer(); grpcSrv != nil && !customGRPC {
+		cleanup = append(cleanup, grpcSrv.Stop)
+	}
 
-	// Initialize log store for in-memory log retention.
-	if *logStoreMaxMemMB > 0 {
+	// Preserve retained logs across runtime replacements.
+	if *logStoreMaxMemMB > 0 && logger.DefaultLogStore() == nil {
 		ls := logstore.New(int64(*logStoreMaxMemMB)<<20, logger.ParseLogLevel(*logStoreMinLevel))
 		logger.SetDefaultLogStore(ls)
 	}
@@ -341,9 +410,12 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 		tl := logger.NewWithAttrs(slog.String("component", "tracing"))
 		tracingShutdown, err = tracing.Init(context.Background(), cfg.GetTracing(), tl)
 		if err != nil {
-			return fmt.Errorf("error while initializing tracing: %v", err)
+			return instance{}, fmt.Errorf("error while initializing tracing: %v", err)
 		}
 		cleanup = append(cleanup, func() { shutdownTracing(tracingShutdown) })
+	} else if reloading {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
 	}
 
 	// initCtx is used to clean up in case of partial initialization failures. For
@@ -352,14 +424,17 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 	// pr.Init returns an error and we cancel the initCtx, which makes servers
 	// close their listeners.
 	// TODO(manugarg): Plumb init context from cmd/cloudprober.
-	initCtx, cancelFunc := context.WithCancel(context.TODO())
+	initCtx, cancelFunc := context.WithCancel(context.Background())
+	if reloading {
+		initCtx = filesurfacer.WithAppend(initCtx)
+	}
 	cleanup = append(cleanup, cancelFunc)
 	pr, err := prober.Init(initCtx, cfg, globalLogger)
 	if err != nil {
-		return err
+		return instance{}, err
 	}
 
-	cloudProber.instance = instance{
+	inst := instance{
 		prober:          pr,
 		config:          cfg,
 		configSource:    configSrc,
@@ -367,12 +442,32 @@ func initWithConfigSource(configSrc config.ConfigSource) error {
 		defaultGRPCLn:   grpcLn,
 		cancelInitCtx:   cancelFunc,
 		tracingShutdown: tracingShutdown,
+		grpcSrv:         state.DefaultGRPCServer(),
+		customGRPC:      customGRPC,
+		rawConfig:       configSrc.RawConfig(),
+		parsedConfig:    configSrc.ParsedConfig(),
+	}
+
+	cleanup = append(cleanup, pr.Stop)
+	pr.SetReloadConfigFunc(func(ctx context.Context) error {
+		return reloadConfig(ctx, pr)
+	})
+	if err := web.InitWithDataFuncs(web.DataFuncs{
+		GetRawConfig: GetRawConfig, GetParsedConfig: GetParsedConfig, GetInfo: GetInfo,
+	}); err != nil {
+		return instance{}, err
+	}
+
+	if err := state.AddWebHandler("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "OK")
+	}); err != nil {
+		return instance{}, err
 	}
 
 	// Ownership of all acquired resources has transferred to cloudProber;
 	// skip the rollback.
 	cleanup = nil
-	return nil
+	return inst, nil
 }
 
 // RunOnce runs requested probes once and print probe results to stdout.
@@ -409,46 +504,168 @@ func RunOnce(ctx context.Context, names, format, indent string) error {
 // nothing else will. That includes zombie children of the embedding binary
 // itself, if it leaves any unwaited-for for more than a few minutes.
 func Start(ctx context.Context) {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	cloudProber.Lock()
 	defer cloudProber.Unlock()
-
-	// If we're init in our PID namespace (the usual case for our container
-	// images), orphaned processes -- e.g. browser processes left behind by the
-	// browser probe -- are reparented to us, and it's on us to reap them. This
-	// is a no-op if somebody else is collecting orphans, e.g. /pause with
-	// shareProcessNamespace on Kubernetes, or tini with docker's --init.
-	// Probes and servers run on a context derived from the caller's, so that
-	// Shutdown() can stop them even while the caller's context is still live.
-	startCtx, cancelStartCtx := context.WithCancel(ctx)
-	cloudProber.cancelStartCtx = cancelStartCtx
-
-	reaper.Start(startCtx, logger.NewWithAttrs(slog.String("component", "reaper")))
-
-	// Default servers
-	srvMux := state.DefaultHTTPServeMux()
-	httpSrv := &http.Server{Handler: srvMux}
-	grpcSrv := state.DefaultGRPCServer()
-	cloudProber.httpSrv = httpSrv
-
-	// Set up a goroutine to cleanup if context ends.
-	go func() {
-		<-startCtx.Done()
-		Shutdown()
-	}()
-
-	go httpSrv.Serve(cloudProber.defaultServerLn)
-	if grpcSrv != nil && cloudProber.defaultGRPCLn != nil {
-		go grpcSrv.Serve(cloudProber.defaultGRPCLn)
-	}
-
 	if cloudProber.prober == nil {
-		panic("Prober is not initialized. Did you call cloudprober.InitFromConfig first?")
+		panic("Prober is not initialized. Did you call cloudprober.Init first?")
+	}
+	if cloudProber.lifetimeCtx != nil {
+		panic("cloudprober is already started")
+	}
+	lifetimeCtx, cancel := context.WithCancel(ctx)
+	cloudProber.lifetimeCtx = lifetimeCtx
+	cloudProber.cancelLifetime = cancel
+	cloudProber.stopWatch = context.AfterFunc(lifetimeCtx, Shutdown)
+	reaper.Start(lifetimeCtx, logger.NewWithAttrs(slog.String("component", "reaper")))
+	cloudProber.instance.start()
+}
+
+func (inst *instance) start() {
+	startCtx, cancel := context.WithCancel(inst.lifetimeCtx)
+	inst.cancelStartCtx = cancel
+	srvMux := state.DefaultHTTPServeMux()
+	inst.httpSrv = &http.Server{Handler: srvMux}
+	// Initialize the probe runtime before accepting management requests.
+	inst.prober.Start(startCtx)
+	go inst.httpSrv.Serve(inst.defaultServerLn)
+	if inst.grpcSrv != nil && inst.defaultGRPCLn != nil {
+		go inst.grpcSrv.Serve(inst.defaultGRPCLn)
+	}
+}
+
+// stop releases a runtime's resources. On reload, the caller retires the gRPC
+// server separately because the ReloadConfig call itself is still using it.
+func (inst *instance) stop(reloading bool) {
+	if inst.cancelStartCtx != nil {
+		inst.cancelStartCtx()
+	}
+	if inst.cancelInitCtx != nil {
+		inst.cancelInitCtx()
+	}
+	if inst.prober != nil {
+		inst.prober.Stop()
+	}
+	if inst.httpSrv != nil {
+		inst.httpSrv.Close()
+	}
+	if inst.defaultServerLn != nil {
+		inst.defaultServerLn.Close()
+	}
+	if inst.defaultGRPCLn != nil {
+		inst.defaultGRPCLn.Close()
+	}
+	if inst.grpcSrv != nil && !reloading {
+		inst.grpcSrv.Stop()
+	}
+	shutdownTracing(inst.tracingShutdown)
+}
+
+func retireGRPCServer(srv *grpc.Server) {
+	if srv == nil {
+		return
+	}
+	go func() {
+		timer := time.AfterFunc(5*time.Second, srv.Stop)
+		defer timer.Stop()
+		srv.GracefulStop()
+	}()
+}
+
+// ReloadConfig rereads the original configuration source and replaces all
+// configured components without restarting the process. Runtime state and
+// counters are reset. If replacement fails, the previous configuration is
+// reinitialized. Syntax errors do not interrupt the running instance.
+func ReloadConfig(ctx context.Context) error {
+	return reloadConfig(ctx, nil)
+}
+
+func reloadConfig(ctx context.Context, caller *prober.Prober) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	if cloudProber.done || cloudProber.prober == nil || cloudProber.lifetimeCtx == nil {
+		return status.Error(codes.FailedPrecondition, "cloudprober is not running")
+	}
+	if caller != nil && caller != cloudProber.prober {
+		return status.Error(codes.Aborted, "this configuration has already been replaced; reconnect and retry")
+	}
+	if cloudProber.lifetimeCtx.Err() != nil {
+		return status.Error(codes.FailedPrecondition, "cloudprober is shutting down")
+	}
+	if cloudProber.customGRPC {
+		return status.Error(codes.FailedPrecondition, "reload requires a Cloudprober-managed gRPC server; an injected server cannot be recreated with its original options")
 	}
 
-	cloudProber.prober.Start(startCtx)
-	srvMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "OK")
-	})
+	old := cloudProber.instance
+	cfg, err := old.configSource.GetConfig()
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "cannot read configuration: %v", err)
+	}
+	if cfg == nil {
+		return status.Error(codes.InvalidArgument, "configuration is nil")
+	}
+	if err := proto.CheckInitialized(cfg); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid configuration: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+
+	// Once teardown begins, finish replacement (or rollback) even if the caller
+	// disconnects. Otherwise cancellation could leave the process without probes.
+	old.stop(true)
+	// Include API-added probes and omit API-removed probes if rollback is
+	// needed. The source snapshot itself remains unchanged for config readers.
+	rollbackConfig := proto.Clone(old.config).(*configpb.ProberConfig)
+	activeProbes, _, _ := old.prober.SnapshotInfo()
+	names := make([]string, 0, len(activeProbes))
+	for name := range activeProbes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rollbackConfig.Probe = nil
+	for _, name := range names {
+		rollbackConfig.Probe = append(rollbackConfig.Probe, proto.Clone(activeProbes[name].ProbeDef).(*probes_configpb.ProbeDef))
+	}
+	// Start draining only after replacement or rollback finishes, leaving time
+	// to deliver this RPC's response. Bound idle reflection streams as well.
+	defer retireGRPCServer(old.grpcSrv)
+	state.ResetRuntime()
+	targets.ResetRuntime()
+	alerting.ResetStatus()
+	inst, applyErr := newInstance(old.configSource, withSystemProbe(cfg), true)
+	if applyErr != nil {
+		state.ResetRuntime()
+		targets.ResetRuntime()
+		inst, err = newInstance(old.configSource, rollbackConfig, true)
+		if err != nil {
+			cloudProber.Lock()
+			cloudProber.instance = instance{
+				configSource: old.configSource, config: old.config,
+				rawConfig: old.rawConfig, parsedConfig: old.parsedConfig,
+				lifetimeCtx: old.lifetimeCtx, cancelLifetime: old.cancelLifetime,
+				stopWatch: old.stopWatch,
+			}
+			cloudProber.Unlock()
+			return status.Errorf(codes.Internal, "reload failed: %v; restoring previous configuration also failed: %v", applyErr, err)
+		}
+		inst.rawConfig, inst.parsedConfig = old.rawConfig, old.parsedConfig
+		inst.config = old.config
+	}
+	inst.lifetimeCtx, inst.cancelLifetime = old.lifetimeCtx, old.cancelLifetime
+	inst.stopWatch = old.stopWatch
+	cloudProber.Lock()
+	inst.start()
+	cloudProber.instance = inst
+	cloudProber.Unlock()
+	if applyErr != nil {
+		return status.Errorf(codes.InvalidArgument, "reload failed; previous configuration restored: %v", applyErr)
+	}
+	return nil
 }
 
 // shutdownTracing flushes any buffered trace spans and shuts tracing down. The
@@ -475,11 +692,12 @@ func shutdownTracing(shutdownFunc tracing.ShutdownFunc) {
 // starting the prober, e.g. RunOnce, which would otherwise leave the default
 // servers' listeners open and buffered spans unexported.
 //
-// Note that probes and user-configured servers are only signaled to stop, so
-// they may still be going away when Shutdown returns. Shutdown also stops the
-// default gRPC server, including one that an embedder installed through
-// state.SetDefaultGRPCServer.
+// Shutdown waits for probe and server workers and closes their resources.
+// It also stops the default gRPC server, including one that an embedder
+// installed through state.SetDefaultGRPCServer.
 func Shutdown() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	cloudProber.Lock()
 	if cloudProber.done {
 		cloudProber.Unlock()
@@ -490,64 +708,66 @@ func Shutdown() {
 	cloudProber.instance = instance{}
 	cloudProber.Unlock()
 
-	// Nothing can hand out or replace these resources anymore, so the rest
-	// happens without the lock: stopping the gRPC server waits for its
-	// transports and flushing spans waits for the collector, and config and
-	// info readers shouldn't have to wait behind either.
-
-	// Closing the HTTP server closes the listener it's serving on, but we
-	// close the listeners directly as well, for the paths that acquired them
-	// in Init and never got to Start.
-	if inst.httpSrv != nil {
-		inst.httpSrv.Close()
+	if inst.stopWatch != nil {
+		inst.stopWatch()
 	}
-	if inst.defaultServerLn != nil {
-		inst.defaultServerLn.Close()
+	if inst.cancelLifetime != nil {
+		inst.cancelLifetime()
 	}
-	if grpcSrv := state.DefaultGRPCServer(); grpcSrv != nil {
-		grpcSrv.Stop()
+	// Keep compatibility for callers that supplied a gRPC server before Init.
+	if inst.grpcSrv == nil {
+		inst.grpcSrv = state.DefaultGRPCServer()
 	}
-	if inst.defaultGRPCLn != nil {
-		inst.defaultGRPCLn.Close()
-	}
-
-	// Stop the probes and the user-configured servers, then the modules set up
-	// during the initialization, and flush the spans they produced last.
-	if inst.cancelStartCtx != nil {
-		inst.cancelStartCtx()
-	}
-	if inst.cancelInitCtx != nil {
-		inst.cancelInitCtx()
-	}
-	shutdownTracing(inst.tracingShutdown)
+	inst.stop(false)
+	state.ResetRuntime()
+	targets.ResetRuntime()
+	alerting.ResetStatus()
 }
 
 // GetConfig returns the prober config.
 func GetConfig() *configpb.ProberConfig {
 	cloudProber.RLock()
 	defer cloudProber.RUnlock()
-	return cloudProber.config
+	if cloudProber.config == nil {
+		return nil
+	}
+	return proto.Clone(cloudProber.config).(*configpb.ProberConfig)
 }
 
 // GetRawConfig returns the prober config in text proto format.
 func GetRawConfig() string {
 	cloudProber.RLock()
 	defer cloudProber.RUnlock()
-	return cloudProber.configSource.RawConfig()
+	if cloudProber.config == nil && cloudProber.configSource == nil {
+		return ""
+	}
+	if cloudProber.prober == nil && cloudProber.configSource != nil && cloudProber.lifetimeCtx == nil {
+		return cloudProber.configSource.RawConfig()
+	}
+	return cloudProber.rawConfig
 }
 
 // GetParsedConfig returns the parsed prober config.
 func GetParsedConfig() string {
 	cloudProber.RLock()
 	defer cloudProber.RUnlock()
-	return cloudProber.configSource.ParsedConfig()
+	if cloudProber.config == nil && cloudProber.configSource == nil {
+		return ""
+	}
+	if cloudProber.prober == nil && cloudProber.configSource != nil && cloudProber.lifetimeCtx == nil {
+		return cloudProber.configSource.ParsedConfig()
+	}
+	return cloudProber.parsedConfig
 }
 
 // GetInfo returns information on all the probes, servers and surfacers.
 func GetInfo() (map[string]*probes.ProbeInfo, []*surfacers.SurfacerInfo, []*servers.ServerInfo) {
 	cloudProber.RLock()
 	defer cloudProber.RUnlock()
-	return cloudProber.prober.Probes, cloudProber.prober.Surfacers, cloudProber.prober.Servers
+	if cloudProber.prober == nil {
+		return nil, nil, nil
+	}
+	return cloudProber.prober.SnapshotInfo()
 }
 
 func GetProber() *prober.Prober {

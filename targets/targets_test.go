@@ -441,3 +441,19 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+func TestResetRuntimeClearsSharedTargets(t *testing.T) {
+	t.Cleanup(ResetRuntime)
+	cfg := &targetspb.TargetsDef{Type: &targetspb.TargetsDef_SharedTargets{SharedTargets: "reload-test"}}
+	SetSharedTargets("reload-test", StaticTargets("old.example.com"))
+	oldTargets, err := New(cfg, nil, nil, nil, nil)
+	assert.NoError(t, err)
+	ResetRuntime()
+	_, err = New(cfg, nil, nil, nil, nil)
+	assert.Error(t, err, "old shared targets must not be visible to the replacement runtime")
+	SetSharedTargets("reload-test", StaticTargets("new.example.com"))
+	newTargets, err := New(cfg, nil, nil, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, "old.example.com", oldTargets.ListEndpoints()[0].Name)
+	assert.Equal(t, "new.example.com", newTargets.ListEndpoints()[0].Name)
+}

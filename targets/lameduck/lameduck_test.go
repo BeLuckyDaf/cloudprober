@@ -113,3 +113,25 @@ func funcListResources(ctx context.Context, in *rdspb.ListResourcesRequest) (*rd
 
 	return &rdspb.ListResourcesResponse{Resources: resources}, nil
 }
+
+func TestResetRuntimeAllowsReplacement(t *testing.T) {
+	ResetRuntime()
+	t.Cleanup(ResetRuntime)
+	if err := InitDefaultLister(nil, &mockLDLister{[]string{"old"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ResetRuntime()
+	if _, err := GetDefaultLister(); err == nil {
+		t.Fatal("old lameduck lister remained registered")
+	}
+	if err := InitDefaultLister(nil, &mockLDLister{[]string{"new"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetDefaultLister()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := endpoint.NamesFromEndpoints(got.ListEndpoints()); !reflect.DeepEqual(names, []string{"new"}) {
+		t.Fatalf("replacement lister = %v, want new", names)
+	}
+}

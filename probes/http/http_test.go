@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1429,6 +1430,126 @@ func TestNegativeTest(t *testing.T) {
 			// Negative test: reachable target should NOT count as success.
 			assert.Equal(t, int64(1), total, "total for reachable target")
 			assert.Equal(t, int64(0), success, "success for reachable target (negative test)")
+		}
+	}
+}
+
+// Each target receives a clone, so closing only the base transport cannot
+// release pooled connections held by the target clients.
+func TestCloseReleasesTargetClientConnections(t *testing.T) {
+	closed := make(chan struct{}, 4)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			closed <- struct{}{}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	p := &Probe{baseTransport: &http.Transport{}, c: &configpb.ProbeConf{}}
+	client := p.httpClient(endpoint.Endpoint{Name: "test"})
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("target transport kept an idle connection after Close")
+	}
+	// A racing client creation after retirement must not keep new idle sockets.
+	lateClient := p.httpClient(endpoint.Endpoint{Name: "late"})
+	if !lateClient.Transport.(*http.Transport).DisableKeepAlives {
+		t.Error("retired probe created a client with keep-alives enabled")
+	}
+}
+
+type changingHTTPTargets struct {
+	targets.Targets
+	active atomic.Bool
+}
+
+func (t *changingHTTPTargets) ListEndpoints() []endpoint.Endpoint {
+	if !t.active.Load() {
+		return nil
+	}
+	return t.Targets.ListEndpoints()
+}
+
+func TestRemovedTargetReleasesTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	defer server.Close()
+	addr := server.Listener.Addr().(*net.TCPAddr)
+	changing := &changingHTTPTargets{Targets: targets.StaticEndpoints([]endpoint.Endpoint{{Name: "127.0.0.1", IP: addr.IP, Port: addr.Port}})}
+	changing.active.Store(true)
+	opts := options.DefaultOptions()
+	opts.Targets = changing
+	opts.Interval, opts.Timeout = 20*time.Millisecond, 10*time.Millisecond
+	opts.StatsExportInterval, opts.TargetsUpdateInterval = opts.Interval, opts.Interval
+	opts.ProbeConf = &configpb.ProbeConf{ResolveFirst: proto.Bool(true)}
+	p := &Probe{}
+	if err := p.Init("changing-target", opts); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	data := make(chan *metrics.EventMetrics, 100)
+	done := make(chan struct{})
+	go func() { defer close(done); p.Start(ctx, data) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-data:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not run")
+	}
+	p.transportsMu.Lock()
+	initialCount := len(p.transports)
+	p.transportsMu.Unlock()
+	if initialCount != 1 {
+		t.Fatalf("registered transports: got %d, want 1", initialCount)
+	}
+	changing.active.Store(false)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.transportsMu.Lock()
+		count, closing := len(p.transports), p.closing
+		p.transportsMu.Unlock()
+		if closing {
+			t.Fatal("probe stopped instead of cleaning up the removed target")
+		}
+		if count == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("removed target transport remained registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRunOnceReleasesTargetTransports(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	defer server.Close()
+	addr := server.Listener.Addr().(*net.TCPAddr)
+	opts := options.DefaultOptions()
+	opts.Targets = targets.StaticEndpoints([]endpoint.Endpoint{{Name: "127.0.0.1", IP: addr.IP, Port: addr.Port}})
+	opts.ProbeConf = &configpb.ProbeConf{ResolveFirst: proto.Bool(true)}
+	p := &Probe{}
+	if err := p.Init("single-run", opts); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	for i := 0; i < 3; i++ {
+		results := p.RunOnce(context.Background())
+		if len(results) != 1 || !results[0].Success {
+			t.Fatalf("unexpected probe results: %+v", results)
+		}
+		if len(p.transports) != 0 {
+			t.Fatalf("single run retained %d target transports", len(p.transports))
 		}
 	}
 }

@@ -115,3 +115,16 @@ func ConfigFilePath() string {
 	defer st.RUnlock()
 	return st.configFilePath
 }
+
+// ResetRuntime clears state owned by the current configuration. Callers must
+// stop that runtime before resetting it. Build metadata and the config path
+// belong to the process and are preserved.
+func ResetRuntime() {
+	st.Lock()
+	defer st.Unlock()
+	st.grpcSrv = nil
+	st.rdsServer = nil
+	st.httpServeMux = nil
+	st.webURLs = nil
+	st.artifactsURLs = nil
+}

@@ -33,7 +33,12 @@ import (
 
 // New returns new file targets.
 func New(opts *configpb.TargetsConf, res dnsRes.Resolver, l *logger.Logger) (*client.Client, error) {
-	lister, err := file.New(&file_configpb.ProviderConfig{
+	return NewWithContext(context.Background(), opts, res, l)
+}
+
+// NewWithContext creates file targets whose refresh workers stop with ctx.
+func NewWithContext(ctx context.Context, opts *configpb.TargetsConf, res dnsRes.Resolver, l *logger.Logger) (*client.Client, error) {
+	lister, err := file.NewWithContext(ctx, &file_configpb.ProviderConfig{
 		FilePath:  []string{opts.GetFilePath()},
 		ReEvalSec: proto.Int32(opts.GetReEvalSec()),
 	}, l)
@@ -51,7 +56,7 @@ func New(opts *configpb.TargetsConf, res dnsRes.Resolver, l *logger.Logger) (*cl
 		ReEvalSec: proto.Int32(1),
 	}
 
-	return client.New(clientConf, func(_ context.Context, req *rdspb.ListResourcesRequest) (*rdspb.ListResourcesResponse, error) {
+	return client.NewWithContext(ctx, clientConf, func(_ context.Context, req *rdspb.ListResourcesRequest) (*rdspb.ListResourcesResponse, error) {
 		return lister.ListResources(req)
 	}, l)
 }

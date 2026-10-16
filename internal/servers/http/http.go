@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	configpb "github.com/cloudprober/cloudprober/internal/servers/http/proto"
@@ -57,7 +58,11 @@ func (s *Server) statsKeeper(ctx context.Context, name string) {
 			em := metrics.NewEventMetrics(ts).
 				AddMetric("req", s.reqMetric).
 				AddLabel("module", name)
-			s.dataChan <- em
+			select {
+			case s.dataChan <- em:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
@@ -138,6 +143,9 @@ func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
 type Server struct {
 	c                 *configpb.ServerConf
 	ln                net.Listener
+	mu                sync.Mutex
+	srv               *http.Server
+	closed            bool
 	instanceName      string
 	sysVars           map[string]string
 	staticURLResTable map[string][]byte
@@ -150,6 +158,14 @@ type Server struct {
 
 // New returns a Server.
 func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Server, error) {
+	for _, dh := range c.GetPatternDataHandler() {
+		if dh.GetResponseSize() < 0 {
+			return nil, fmt.Errorf("pattern data response_size cannot be negative")
+		}
+		if dh.GetPattern() == "" {
+			return nil, fmt.Errorf("pattern data pattern cannot be empty")
+		}
+	}
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", int(c.GetPort())))
 	if err != nil {
 		return nil, err
@@ -163,17 +179,16 @@ func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Se
 
 	if c.GetProtocol() == configpb.ServerConf_HTTPS {
 		if c.GetTlsCertFile() == "" || c.GetTlsKeyFile() == "" {
+			ln.Close()
 			return nil, errors.New("tls_cert_file and tls_key_file are required for HTTPS servers")
+		}
+		if _, err := tls.LoadX509KeyPair(c.GetTlsCertFile(), c.GetTlsKeyFile()); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("load server TLS certificate: %w", err)
 		}
 	}
 
-	// Cleanup listener if initCtx is canceled.
-	go func() {
-		<-initCtx.Done()
-		ln.Close()
-	}()
-
-	return &Server{
+	s := &Server{
 		c:             c,
 		l:             l,
 		ln:            ln,
@@ -186,7 +201,33 @@ func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Se
 			"/":         []byte(OK),
 			"/instance": []byte(sysvars.GetVar("instance")),
 		},
-	}, nil
+	}
+	for _, dh := range s.c.GetPatternDataHandler() {
+		payload := make([]byte, int(dh.GetResponseSize()))
+		probeutils.PatternPayload(payload, []byte(dh.GetPattern()))
+		s.staticURLResTable[fmt.Sprintf("/data_%d", dh.GetResponseSize())] = payload
+	}
+
+	context.AfterFunc(initCtx, func() { s.Close() })
+	return s, nil
+}
+
+// Close stops serving and releases the listener synchronously.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.srv != nil {
+		s.srv.Close()
+	}
+	if s.ln == nil {
+		return nil
+	}
+	err := s.ln.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // Start starts a simple HTTP server on a given port. This function returns
@@ -196,12 +237,6 @@ func (s *Server) Start(ctx context.Context, dataChan chan<- *metrics.EventMetric
 
 	laddr := s.ln.Addr().String()
 	go s.statsKeeper(ctx, fmt.Sprintf("http-server-%s", laddr))
-
-	for _, dh := range s.c.GetPatternDataHandler() {
-		payload := make([]byte, int(dh.GetResponseSize()))
-		probeutils.PatternPayload(payload, []byte(dh.GetPattern()))
-		s.staticURLResTable[fmt.Sprintf("/data_%d", dh.GetResponseSize())] = payload
-	}
 
 	// Not using default server mux as we may run multiple HTTP servers, e.g. for testing.
 	serverMux := http.NewServeMux()
@@ -215,11 +250,16 @@ func (s *Server) Start(ctx context.Context, dataChan chan<- *metrics.EventMetric
 		IdleTimeout:  time.Duration(s.c.GetIdleTimeoutMs()) * time.Millisecond,
 	}
 
-	// Setup a background function to close server if context is canceled.
-	go func() {
-		<-ctx.Done()
-		srv.Close()
-	}()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.srv = srv
+	s.mu.Unlock()
+	stopClose := context.AfterFunc(ctx, func() { s.Close() })
+	defer stopClose()
+	defer s.Close()
 
 	// HTTP/2 is enabled by default for HTTPS servers. To disable it, TLSNextProto
 	// should be non-nil and set to an empty dict.

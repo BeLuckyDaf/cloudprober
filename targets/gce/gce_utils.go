@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	rdspb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	configpb "github.com/cloudprober/cloudprober/targets/gce/proto"
 	dnsRes "github.com/cloudprober/cloudprober/targets/resolver"
@@ -30,11 +31,13 @@ import (
 
 // defaultComputeService returns the compute service to use for the GCE API
 // calls.
-func defaultComputeService(apiVersion string) (*compute.Service, error) {
-	client, err := google.DefaultClient(context.TODO(), compute.ComputeScope)
+func defaultComputeService(apiVersion string, contexts ...context.Context) (*compute.Service, error) {
+	ctx := lifecycle.Context(contexts...)
+	client, err := google.DefaultClient(ctx, compute.ComputeScope)
 	if err != nil {
 		return nil, err
 	}
+	context.AfterFunc(ctx, client.CloseIdleConnections)
 	cs, err := compute.New(client)
 	if err != nil {
 		return nil, err

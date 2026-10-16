@@ -197,7 +197,9 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	}
 	if p.numConn < wantConn {
 		for _, c := range p.connList {
-			c.Close()
+			if c != nil {
+				c.Close()
+			}
 		}
 		return fmt.Errorf("UDP socket creation failed: got %d connections, want %d", p.numConn, wantConn)
 	}
@@ -515,4 +517,14 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			p.updateTargets()
 		}
 	}
+}
+
+// Close releases resources acquired during initialization and unblocks active I/O.
+func (p *Probe) Close() error {
+	for _, conn := range p.connList {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+	return nil
 }

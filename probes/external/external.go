@@ -74,6 +74,7 @@ type Probe struct {
 	requestID    int32
 	cmdRunning   bool
 	cmdRunningMu sync.Mutex // synchronizes cmdRunning
+	cmdWorkers   sync.WaitGroup
 	cmdStdin     io.Writer
 	cmdStdout    io.ReadCloser
 	cmdStderr    io.ReadCloser
@@ -338,12 +339,20 @@ func (p *Probe) runProbe(startCtx context.Context) {
 
 // Start starts and runs the probe indefinitely.
 func (p *Probe) Start(startCtx context.Context, dataChan chan *metrics.EventMetrics) {
+	defer p.cmdWorkers.Wait()
 	p.dataChan = dataChan
 
 	ticker := time.NewTicker(p.opts.Interval)
 	defer ticker.Stop()
 
-	for ; ; <-ticker.C {
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-startCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
 		select {
 		case <-startCtx.Done():
 			return

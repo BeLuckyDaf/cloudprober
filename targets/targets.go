@@ -23,8 +23,10 @@
 package targets
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"regexp"
 	"strings"
@@ -39,6 +41,7 @@ import (
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 	"github.com/cloudprober/cloudprober/targets/file"
 	"github.com/cloudprober/cloudprober/targets/gce"
+	"github.com/cloudprober/cloudprober/targets/lameduck"
 	targetspb "github.com/cloudprober/cloudprober/targets/proto"
 	dnsRes "github.com/cloudprober/cloudprober/targets/resolver"
 	"google.golang.org/protobuf/proto"
@@ -343,6 +346,11 @@ func rdsClientConf(pb *targetspb.RDSTargets, globalOpts *targetspb.GlobalTargets
 // See cloudprober/targets/targets.proto for more information on the possible
 // configurations of Targets.
 func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts *targetspb.GlobalTargetsOptions, globalLogger, l *logger.Logger) (Targets, error) {
+	return NewWithContext(context.Background(), targetsDef, ldLister, globalOpts, globalLogger, l)
+}
+
+// NewWithContext creates targets whose discovery workers stop with ctx.
+func NewWithContext(ctx context.Context, targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts *targetspb.GlobalTargetsOptions, globalLogger, l *logger.Logger) (Targets, error) {
 	t, err := baseTargets(targetsDef, ldLister, l)
 	if err != nil {
 		globalLogger.Error("Unable to produce the base target lister")
@@ -375,7 +383,7 @@ func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts 
 		t.lister, t.resolver = st, st
 
 	case *targetspb.TargetsDef_GceTargets:
-		s, err := gce.New(targetsDef.GetGceTargets(), globalOpts.GetGlobalGceTargetsOptions(), t.resolver, globalLogger)
+		s, err := gce.NewWithContext(ctx, targetsDef.GetGceTargets(), globalOpts.GetGlobalGceTargetsOptions(), t.resolver, globalLogger)
 		if err != nil {
 			return nil, fmt.Errorf("targets.New(): error creating GCE targets: %v", err)
 		}
@@ -387,7 +395,7 @@ func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts 
 			return nil, fmt.Errorf("target.New(): error creating RDS client: %v", err)
 		}
 
-		client, err := rdsclient.New(clientConf, listResourcesFunc, l)
+		client, err := rdsclient.NewWithContext(ctx, clientConf, listResourcesFunc, l)
 		if err != nil {
 			return nil, fmt.Errorf("target.New(): error creating RDS client: %v", err)
 		}
@@ -395,14 +403,14 @@ func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts 
 		t.lister, t.resolver = client, client
 
 	case *targetspb.TargetsDef_FileTargets:
-		ft, err := file.New(targetsDef.GetFileTargets(), t.resolver, l)
+		ft, err := file.NewWithContext(ctx, targetsDef.GetFileTargets(), t.resolver, l)
 		if err != nil {
 			return nil, fmt.Errorf("target.New(): %v", err)
 		}
 		t.lister, t.resolver = ft, ft
 
 	case *targetspb.TargetsDef_K8S:
-		kt, err := k8sTargets(targetsDef.GetK8S(), l)
+		kt, err := k8sTargetsWithContext(ctx, targetsDef.GetK8S(), l)
 		if err != nil {
 			return nil, fmt.Errorf("target.New(): error creating K8s targets: %v", err)
 		}
@@ -420,6 +428,9 @@ func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts 
 				return nil, fmt.Errorf("targets.New(): targets extension: %v", err)
 			}
 			t.lister, t.resolver = extT, extT
+			if closer, ok := extT.(io.Closer); ok {
+				context.AfterFunc(ctx, func() { closer.Close() })
+			}
 		}
 	}
 
@@ -462,4 +473,15 @@ func SetSharedTargets(name string, tgts Targets) {
 	sharedTargetsMu.Lock()
 	defer sharedTargetsMu.Unlock()
 	sharedTargets[name] = tgts
+}
+
+// ResetRuntime drops targets and discovery caches belonging to the old
+// configuration. Call after stopping all probes and cancelling their context.
+func ResetRuntime() {
+	sharedTargetsMu.Lock()
+	sharedTargets = make(map[string]Targets)
+	sharedTargetsMu.Unlock()
+	resetK8S()
+	gce.ResetRuntime()
+	lameduck.ResetRuntime()
 }

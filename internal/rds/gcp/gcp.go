@@ -30,6 +30,7 @@ GCP provider is configured through a protobuf based config file
 package gcp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -105,12 +106,12 @@ func (p *Provider) ListResources(req *pb.ListResourcesRequest) (*pb.ListResource
 	return &pb.ListResourcesResponse{Resources: resources}, err
 }
 
-func initGCPProject(project string, c *configpb.ProviderConfig, l *logger.Logger) (map[string]lister, error) {
+func initGCPProject(ctx context.Context, project string, c *configpb.ProviderConfig, l *logger.Logger) (map[string]lister, error) {
 	projectLister := make(map[string]lister)
 
 	// Enable GCE instances lister if configured.
 	if c.GetGceInstances() != nil {
-		lr, err := newGCEInstancesLister(project, c.GetApiVersion(), c.GetApiEndpoint(), c.GetGceInstances(), l)
+		lr, err := newGCEInstancesLister(project, c.GetApiVersion(), c.GetApiEndpoint(), c.GetGceInstances(), l, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +120,7 @@ func initGCPProject(project string, c *configpb.ProviderConfig, l *logger.Logger
 
 	// Enable forwarding rules lister if configured.
 	if c.GetForwardingRules() != nil {
-		lr, err := newForwardingRulesLister(project, c.GetApiVersion(), c.GetApiEndpoint(), c.GetForwardingRules(), l)
+		lr, err := newForwardingRulesLister(project, c.GetApiVersion(), c.GetApiEndpoint(), c.GetForwardingRules(), l, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -128,7 +129,7 @@ func initGCPProject(project string, c *configpb.ProviderConfig, l *logger.Logger
 
 	// Enable RTC variables lister if configured.
 	if c.GetPubsubMessages() != nil {
-		lr, err := newPubSubMsgsLister(project, c.GetPubsubMessages(), l)
+		lr, err := newPubSubMsgsLister(project, c.GetPubsubMessages(), l, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +138,7 @@ func initGCPProject(project string, c *configpb.ProviderConfig, l *logger.Logger
 
 	// Enable RTC variables lister if configured.
 	if c.GetRtcVariables() != nil {
-		lr, err := newRTCVariablesLister(project, c.GetApiVersion(), c.GetRtcVariables(), l)
+		lr, err := newRTCVariablesLister(project, c.GetApiVersion(), c.GetRtcVariables(), l, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -149,6 +150,12 @@ func initGCPProject(project string, c *configpb.ProviderConfig, l *logger.Logger
 
 // New creates a GCP provider for RDS server, based on the provided config.
 func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
+	return NewWithContext(context.Background(), c, l)
+}
+
+// NewWithContext creates a provider whose API calls and refresh workers stop
+// with ctx.
+func NewWithContext(ctx context.Context, c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 	projects := c.GetProject()
 	if len(projects) == 0 {
 		if !metadata.OnGCE() {
@@ -169,7 +176,7 @@ func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 	}
 
 	for _, project := range projects {
-		projectLister, err := initGCPProject(project, c, l)
+		projectLister, err := initGCPProject(ctx, project, c, l)
 		if err != nil {
 			return nil, err
 		}

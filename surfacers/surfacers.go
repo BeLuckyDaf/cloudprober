@@ -27,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -175,6 +176,14 @@ func (si *SurfacerInfo) UnwrapSurfacer() Surfacer {
 	return si.Surfacer
 }
 
+// Close releases resources owned by the underlying surfacer, if supported.
+func (si *SurfacerInfo) Close() error {
+	if closer, ok := si.UnwrapSurfacer().(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func inferType(s *surfacerpb.SurfacerDef) surfacerpb.Type {
 	switch s.Surfacer.(type) {
 	case *surfacerpb.SurfacerDef_PrometheusSurfacer:
@@ -289,7 +298,16 @@ func getExtensionSurfacer(p *surfacerpb.SurfacerDef) (Surfacer, any, error) {
 
 // Init initializes the surfacers from the config protobufs and returns them as
 // a list.
-func Init(ctx context.Context, sDefs []*surfacerpb.SurfacerDef) ([]*SurfacerInfo, error) {
+func Init(ctx context.Context, sDefs []*surfacerpb.SurfacerDef) (result []*SurfacerInfo, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancel()
+			for _, s := range result {
+				s.Close()
+			}
+		}
+	}()
 	// If no surfacers are defined, return default surfacers. This behavior
 	// can be disabled by explicitly specifying "surfacer {}" in the config.
 	if len(sDefs) == 0 {
@@ -298,7 +316,6 @@ func Init(ctx context.Context, sDefs []*surfacerpb.SurfacerDef) ([]*SurfacerInfo
 
 	foundSurfacers := make(map[surfacerpb.Type]bool)
 
-	var result []*SurfacerInfo
 	for _, sDef := range sDefs {
 		sType := sDef.GetType()
 
@@ -314,12 +331,12 @@ func Init(ctx context.Context, sDefs []*surfacerpb.SurfacerDef) ([]*SurfacerInfo
 		}
 
 		if sType == surfacerpb.Type_PROBESTATUS && foundSurfacers[sType] {
-			return nil, fmt.Errorf("probestatus surfacer cannot be defined more than once")
+			return result, fmt.Errorf("probestatus surfacer cannot be defined more than once")
 		}
 
 		s, err := initSurfacer(ctx, sDef, sType)
 		if err != nil {
-			return nil, err
+			return result, err
 		}
 
 		foundSurfacers[sType] = true
@@ -337,7 +354,7 @@ func Init(ctx context.Context, sDefs []*surfacerpb.SurfacerDef) ([]*SurfacerInfo
 		if !foundSurfacers[s.GetType()] {
 			surfacer, err := initSurfacer(ctx, s, s.GetType())
 			if err != nil {
-				return nil, err
+				return result, err
 			}
 			result = append(result, &SurfacerInfo{
 				Surfacer: surfacer,

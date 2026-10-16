@@ -20,6 +20,7 @@ package probes
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/cloudprober/cloudprober/metrics"
@@ -207,6 +208,11 @@ func initProbe(p *configpb.ProbeDef, opts *options.Options) (probe Probe, probeC
 
 	opts.ProbeConf = probeConf
 	err = probe.Init(p.GetName(), opts)
+	if err != nil {
+		if closer, ok := probe.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 	return
 }
 

@@ -92,6 +92,11 @@ func UpdateTLSConfig(tlsConfig *tls.Config, c *configpb.TLSConfig) error {
 
 		if c.GetReloadIntervalSec() > 0 {
 			key := [2]string{certF, keyF}
+			// A newly initialized runtime must observe the certificate loaded
+			// above, even if a previous runtime cached the same file paths.
+			global.mu.Lock()
+			global.cache[key] = cacheEntry{cert: cert, lastReload: time.Now()}
+			global.mu.Unlock()
 
 			reloadCertIfNeeded := func() (*tls.Certificate, error) {
 				global.mu.RLock()

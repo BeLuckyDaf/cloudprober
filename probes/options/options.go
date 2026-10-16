@@ -18,6 +18,7 @@ Package options provides a shared interface to common probe options.
 package options
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -332,6 +333,11 @@ func ValidateProbeConfig(p *configpb.ProbeDef) (*Options, error) {
 // BuildProbeOptions builds probe's options using the provided config and some
 // global params.
 func BuildProbeOptions(p *configpb.ProbeDef, ldLister endpoint.Lister, proberConfig *proberconfigpb.ProberConfig, l *logger.Logger) (*Options, error) {
+	return BuildProbeOptionsWithContext(context.Background(), p, ldLister, proberConfig, l)
+}
+
+// BuildProbeOptionsWithContext binds target discovery to the runtime lifetime.
+func BuildProbeOptionsWithContext(ctx context.Context, p *configpb.ProbeDef, ldLister endpoint.Lister, proberConfig *proberconfigpb.ProberConfig, l *logger.Logger) (*Options, error) {
 	opts, err := ValidateProbeConfig(p)
 	if err != nil {
 		return nil, err
@@ -346,7 +352,7 @@ func BuildProbeOptions(p *configpb.ProbeDef, ldLister endpoint.Lister, proberCon
 		}
 	}
 
-	if opts.Targets, err = targets.New(p.GetTargets(), ldLister, proberConfig.GetGlobalTargetsOptions(), l, opts.Logger); err != nil {
+	if opts.Targets, err = targets.NewWithContext(ctx, p.GetTargets(), ldLister, proberConfig.GetGlobalTargetsOptions(), l, opts.Logger); err != nil {
 		return nil, err
 	}
 

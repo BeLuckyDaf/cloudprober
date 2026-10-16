@@ -361,3 +361,11 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 	// now that nothing will use it again. Matches probes/grpc's Start.
 	p.conn.Close()
 }
+
+// Close releases resources acquired during initialization and unblocks active I/O.
+func (p *Probe) Close() error {
+	if p.conn != nil {
+		_ = p.conn.Close()
+	}
+	return nil
+}

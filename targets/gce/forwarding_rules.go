@@ -15,6 +15,7 @@
 package gce
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 	configpb "github.com/cloudprober/cloudprober/targets/gce/proto"
@@ -34,7 +36,7 @@ import (
 // a cache layer that is best shared by all probes.
 var (
 	globalForwardingRules *forwardingRules
-	onceForwardingRules   sync.Once
+	forwardingRulesMu     sync.Mutex
 )
 
 // forwardingRules is a lister which lists GCE forwarding rules (see
@@ -50,10 +52,14 @@ var (
 // target type. See b/26320525 for more on this.
 //
 // TODO(izzycecil): The cache layer provided by this, instances, lameduck, and resolver
-//               are all pretty similar. RTC will need a similar cache. I should
-//               abstract out this whole cache layer. It will be more testable that
-//               way, and probably more readable, as well.
+//
+//	are all pretty similar. RTC will need a similar cache. I should
+//	abstract out this whole cache layer. It will be more testable that
+//	way, and probably more readable, as well.
 type forwardingRules struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	mu          sync.RWMutex
 	project     string
 	c           *configpb.ForwardingRules
 	names       []string
@@ -68,12 +74,16 @@ type forwardingRules struct {
 // "gcloud compute forwarding-rules list", but with a cache layer reducing the
 // number of actual API calls made.
 func (frp *forwardingRules) ListEndpoints() []endpoint.Endpoint {
+	frp.mu.RLock()
+	defer frp.mu.RUnlock()
 	return endpoint.EndpointsFromNames(frp.names)
 }
 
 // Resolve returns the IP address associated with the forwarding
 // rule. Eventually we can expand this to return protocol and port as well.
 func (frp *forwardingRules) Resolve(name string, ipVer int) (net.IP, error) {
+	frp.mu.RLock()
+	defer frp.mu.RUnlock()
 	f := frp.cache[name]
 	if f == nil {
 		return nil, fmt.Errorf("gce.forwardingRulesProvider.resolve(%s): forwarding rule not in in-memory GCE forwardingRules database", name)
@@ -88,14 +98,14 @@ func (frp *forwardingRules) Resolve(name string, ipVer int) (net.IP, error) {
 func (frp *forwardingRules) expand() {
 	frp.l.Infof("gce.forwardingRules.expand: expanding GCE targets")
 
-	cs, err := defaultComputeService(frp.apiVersion)
+	cs, err := defaultComputeService(frp.apiVersion, frp.ctx)
 	if err != nil {
 		frp.l.Errorf("gce.forwardingRules.expand: error while creating the compute service: %v", err)
 		return
 	}
 	var forwardingRulesList []*compute.ForwardingRule
 	if frp.globalRule {
-		l, err := cs.GlobalForwardingRules.List(frp.project).Do()
+		l, err := cs.GlobalForwardingRules.List(frp.project).Context(lifecycle.Context(frp.ctx)).Do()
 		if err != nil {
 			frp.l.Errorf("gce.forwardingRules.expand(global): error while getting the list of global forwarding rules: %v", err)
 			return
@@ -109,7 +119,7 @@ func (frp *forwardingRules) expand() {
 		}
 
 		for _, region := range regions {
-			l, err := cs.ForwardingRules.List(frp.project, region).Do()
+			l, err := cs.ForwardingRules.List(frp.project, region).Context(lifecycle.Context(frp.ctx)).Do()
 			if err != nil {
 				frp.l.Errorf("gce.forwardingRules.expand(region=%s): error while getting the list of forwarding rules: %v", region, err)
 				return
@@ -118,13 +128,17 @@ func (frp *forwardingRules) expand() {
 		}
 	}
 	var result []string
+	cache := make(map[string]*compute.ForwardingRule)
 	for _, ins := range forwardingRulesList {
-		frp.cache[ins.Name] = ins
+		cache[ins.Name] = ins
 		result = append(result, ins.Name)
 	}
 
 	frp.l.Debugf("Expanded target list: %q", result)
+	frp.mu.Lock()
+	frp.cache = cache
 	frp.names = result
+	frp.mu.Unlock()
 }
 
 // getTargetRegions returns the list of regions we are interested in based on
@@ -140,7 +154,7 @@ func (frp *forwardingRules) getTargetRegions(cs *compute.Service) ([]string, err
 		return frp.c.GetRegion(), nil
 	}
 
-	l, err := cs.Regions.List(frp.project).Do()
+	l, err := cs.Regions.List(frp.project).Context(lifecycle.Context(frp.ctx)).Do()
 	if err != nil {
 		return nil, err
 	}
@@ -170,47 +184,38 @@ func getLocalRegion() (string, error) {
 
 // newForwardingrules will (if needed) initialize and return the
 // globalForwardingRules singleton.
-func newForwardingRules(project string, opts *configpb.GlobalOptions, frpb *configpb.ForwardingRules, l *logger.Logger) (*forwardingRules, error) {
-	reEvalInterval := time.Duration(opts.GetReEvalSec()) * time.Second
-
-	var localRegion string
-	var err error
-
-	// Initialize forwardingRules provider only once
-	onceForwardingRules.Do(func() {
-
-		if !frpb.GetGlobalRule() && len(frpb.GetRegion()) == 0 {
-			localRegion, err = getLocalRegion()
-			if err != nil {
-				err = fmt.Errorf("gce.newForwardingRules: error while getting local region: %v", err)
-				return
-			}
-			l.Infof("gce.newForwardingRules: local region: %s", localRegion)
-		}
-
-		globalForwardingRules = &forwardingRules{
-			project:     project,
-			c:           frpb,
-			localRegion: localRegion,
-			globalRule:  frpb.GetGlobalRule(),
-			cache:       make(map[string]*compute.ForwardingRule),
-			apiVersion:  opts.GetApiVersion(),
-			l:           l,
-		}
-
-		go func() {
-			globalForwardingRules.expand()
-			ticker := time.NewTicker(reEvalInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				globalForwardingRules.expand()
-			}
-		}()
-	})
-
-	if err != nil {
-		return nil, err
+func newForwardingRules(project string, opts *configpb.GlobalOptions, frpb *configpb.ForwardingRules, l *logger.Logger, contexts ...context.Context) (*forwardingRules, error) {
+	forwardingRulesMu.Lock()
+	defer forwardingRulesMu.Unlock()
+	if globalForwardingRules != nil {
+		return globalForwardingRules, nil
 	}
-
-	return globalForwardingRules, err
+	reEvalInterval := time.Duration(opts.GetReEvalSec()) * time.Second
+	if reEvalInterval <= 0 {
+		return nil, fmt.Errorf("gce.forwarding_rules: re_eval_sec must be positive")
+	}
+	var localRegion string
+	if !frpb.GetGlobalRule() && len(frpb.GetRegion()) == 0 {
+		var err error
+		localRegion, err = getLocalRegion()
+		if err != nil {
+			return nil, fmt.Errorf("gce.newForwardingRules: error while getting local region: %v", err)
+		}
+		l.Infof("gce.newForwardingRules: local region: %s", localRegion)
+	}
+	ctx, cancel := context.WithCancel(lifecycle.Context(contexts...))
+	frp := &forwardingRules{
+		ctx:         ctx,
+		cancel:      cancel,
+		project:     project,
+		c:           frpb,
+		localRegion: localRegion,
+		globalRule:  frpb.GetGlobalRule(),
+		cache:       make(map[string]*compute.ForwardingRule),
+		apiVersion:  opts.GetApiVersion(),
+		l:           l,
+	}
+	globalForwardingRules = frp
+	go lifecycle.Run(ctx, reEvalInterval, frp.expand, frp.expand)
+	return frp, nil
 }

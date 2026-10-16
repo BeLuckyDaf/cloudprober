@@ -102,6 +102,7 @@ func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Se
 	srv.msg = make([]byte, maxMsgSize)
 	probeutils.PatternPayload(srv.msg, msgPattern)
 	if c.GetUseDedicatedServer() {
+		srv.dedicatedSrv = true
 		if err := srv.newGRPCServer(initCtx); err != nil {
 			return nil, err
 		}
@@ -128,11 +129,6 @@ func (s *Server) newGRPCServer(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Cleanup listener if ctx is canceled.
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
 
 	s.ln = ln
 	s.grpcSrv = grpcSrv
@@ -141,7 +137,27 @@ func (s *Server) newGRPCServer(ctx context.Context) error {
 
 	spb.RegisterProberServer(grpcSrv, s)
 	healthpb.RegisterHealthServer(grpcSrv, healthSrv)
+	context.AfterFunc(ctx, func() { s.Close() })
 	return nil
+}
+
+// Close releases resources owned by a dedicated server. The default gRPC
+// server belongs to the caller and may be handling the reload request itself.
+func (s *Server) Close() error {
+	if !s.dedicatedSrv {
+		return nil
+	}
+	if s.grpcSrv != nil {
+		s.grpcSrv.Stop()
+	}
+	if s.ln == nil {
+		return nil
+	}
+	err := s.ln.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // Start starts the gRPC server and serves requests until the context is
@@ -154,14 +170,9 @@ func (s *Server) Start(ctx context.Context, dataChan chan<- *metrics.EventMetric
 	}
 
 	s.l.Infof("Starting gRPC server at %s", s.ln.Addr().String())
-	go func() {
-		<-ctx.Done()
-		s.l.Infof("Context canceled. Shutting down the gRPC server at: %s", s.ln.Addr().String())
-		for svc := range s.grpcSrv.GetServiceInfo() {
-			s.healthSrv.SetServingStatus(svc, healthpb.HealthCheckResponse_NOT_SERVING)
-		}
-		s.grpcSrv.Stop()
-	}()
+	stopClose := context.AfterFunc(ctx, func() { s.Close() })
+	defer stopClose()
+	defer s.Close()
 	for si := range s.grpcSrv.GetServiceInfo() {
 		s.healthSrv.SetServingStatus(si, healthpb.HealthCheckResponse_SERVING)
 	}

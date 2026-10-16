@@ -17,6 +17,7 @@ package sched
 
 import (
 	"context"
+	"io"
 	"math/rand"
 	"sort"
 	"sync"
@@ -78,12 +79,19 @@ type RunProbeForTargetRequest struct {
 	// TargetState is an optional field that is used to pass around and retain
 	// state across probe runs. It's typically filled by the individual probe
 	// type. For example, http probe uses this field to cache HTTP request and
-	// clients.
+	// clients. If it implements io.Closer, it is closed when this target
+	// is removed, the scheduler stops, or a single run completes.
 	TargetState any
 
 	// LastRun, if non-nil, is populated by the probe with the result of the
 	// last run. Caller controls opt-in by setting this to a non-nil value.
 	LastRun *LastRunResult
+}
+
+func (r *RunProbeForTargetRequest) closeTargetState() {
+	if closer, ok := r.TargetState.(io.Closer); ok {
+		_ = closer.Close()
+	}
 }
 
 type Scheduler struct {
@@ -166,11 +174,19 @@ func (s *Scheduler) startForTarget(ctx context.Context, target endpoint.Endpoint
 	defer ticker.Stop()
 
 	runReq := &RunProbeForTargetRequest{Target: target}
+	defer runReq.closeTargetState()
 	if s.NewResult != nil {
 		runReq.Result = s.NewResult(&target)
 	}
 
-	for ts := time.Now(); true; ts = <-ticker.C {
+	for ts, first := time.Now(), true; ; first = false {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case ts = <-ticker.C:
+			}
+		}
 		// Don't run another probe if context is canceled already.
 		if CtxDone(ctx) {
 			return
@@ -270,7 +286,9 @@ func (s *Scheduler) refreshTargets(ctx context.Context) {
 					jitterMaxUsec = 1
 				}
 				// Wait for wait time + some jitter before starting this probe loop.
-				time.Sleep(waitTime + time.Duration(rand.Int63n(jitterMaxUsec))*time.Microsecond)
+				if !WaitContext(probeCtx, waitTime+time.Duration(rand.Int63n(jitterMaxUsec))*time.Microsecond) {
+					return
+				}
 			}
 			s.startForTarget(probeCtx, target)
 		}(target, startWaitTime)
@@ -298,6 +316,7 @@ func RunOnce(ctx context.Context, opts *options.Options, run func(context.Contex
 				Target:  target,
 				LastRun: &LastRunResult{},
 			}
+			defer runReq.closeTargetState()
 
 			timedCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 			defer cancel()
@@ -352,7 +371,9 @@ func (s *Scheduler) UpdateTargetsAndStartProbes(ctx context.Context) {
 			break
 		}
 		s.refreshTargets(ctx)
-		time.Sleep(initialRefreshInterval)
+		if !WaitContext(ctx, initialRefreshInterval) {
+			return
+		}
 	}
 
 	targetsUpdateTicker := time.NewTicker(s.targetsUpdateInterval)
@@ -365,5 +386,17 @@ func (s *Scheduler) UpdateTargetsAndStartProbes(ctx context.Context) {
 		case <-targetsUpdateTicker.C:
 			s.refreshTargets(ctx)
 		}
+	}
+}
+
+// WaitContext waits for a delay unless the work is canceled first.
+func WaitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
 	}
 }

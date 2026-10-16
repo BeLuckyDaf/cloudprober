@@ -47,6 +47,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudprober/cloudprober/internal/surfacers/common/response"
 	configpb "github.com/cloudprober/cloudprober/internal/surfacers/prometheus/proto"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
@@ -176,6 +177,9 @@ func shouldIncludeTimestamp(c *configpb.SurfacerConf) defaultBoolEnum {
 //
 // Data key represents a unique combination of metric name and labels.
 type PromSurfacer struct {
+	cancel                 context.CancelFunc
+	runtimeDone            <-chan struct{}
+	done                   chan struct{}
 	c                      *configpb.SurfacerConf // Configuration
 	opts                   *options.Options
 	includeTimestamp       defaultBoolEnum
@@ -204,7 +208,13 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 	if config == nil {
 		config = &configpb.SurfacerConf{}
 	}
+	if config.GetMetricsBufferSize() < 0 {
+		return nil, fmt.Errorf("prometheus metrics_buffer_size cannot be negative")
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	ps := &PromSurfacer{
+		cancel:       cancel,
+		runtimeDone:  ctx.Done(),
 		c:            config,
 		opts:         opts,
 		emChan:       make(chan *metrics.EventMetrics, config.GetMetricsBufferSize()),
@@ -215,6 +225,13 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		prefix:       *metricsPrefixFlag,
 		l:            l,
 	}
+
+	initialized := false
+	defer func() {
+		if !initialized {
+			ps.Close()
+		}
+	}()
 
 	ps.includeTimestamp = shouldIncludeTimestamp(ps.c)
 
@@ -245,7 +262,9 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		sweepInterval = ps.staleMetricsExpiration
 	}
 
+	ps.done = make(chan struct{})
 	go func() {
+		defer close(ps.done)
 		staleMetricDeleteTimer := time.NewTicker(sweepInterval)
 		defer staleMetricDeleteTimer.Stop()
 
@@ -273,16 +292,49 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 	err := state.AddWebHandler(ps.c.GetMetricsUrl(), func(w http.ResponseWriter, r *http.Request) {
 		// doneChan is used to track the completion of the response writing. This is
 		// required as response is written in a different goroutine.
-		doneChan := make(chan struct{}, 1)
-		ps.queryChan <- &httpWriter{w: w, protobuf: acceptsProtobuf(r.Header.Get("Accept")), doneChan: doneChan}
-		<-doneChan
+		if ctx.Err() != nil {
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+			return
+		}
+		buffered := response.New()
+		doneChan := make(chan struct{})
+		select {
+		case ps.queryChan <- &httpWriter{w: buffered, protobuf: acceptsProtobuf(r.Header.Get("Accept")), doneChan: doneChan}:
+		case <-ctx.Done():
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			return
+		}
+		select {
+		case <-doneChan:
+			buffered.WriteTo(w)
+		case <-ctx.Done():
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+		case <-r.Context().Done():
+		}
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	l.Infof("Initialized prometheus exporter at the URL: %s", ps.c.GetMetricsUrl())
+	initialized = true
 	return ps, nil
+}
+
+// Close stops the worker and waits for queued response processing to stop.
+func (ps *PromSurfacer) Close() error {
+	if ps == nil {
+		return nil
+	}
+	if ps.cancel != nil {
+		ps.cancel()
+	}
+	if ps.done != nil {
+		<-ps.done
+	}
+	return nil
 }
 
 // Write queues the incoming data into a channel. This channel is watched by a

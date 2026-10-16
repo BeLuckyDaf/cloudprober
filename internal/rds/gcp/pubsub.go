@@ -23,6 +23,7 @@ import (
 
 	"cloud.google.com/go/pubsub"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/gcp/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -140,10 +141,16 @@ func (lister *pubsubMsgsLister) initSubscriber(ctx context.Context, sub *configp
 	return s, nil
 }
 
-func (lister *pubsubMsgsLister) cleanup() {
+func (lister *pubsubMsgsLister) cleanup(contexts ...context.Context) {
+	ctx := lifecycle.Context(contexts...)
 	ticker := time.NewTicker(lister.maxAge)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		lister.mu.Lock()
 
 		for _, msgs := range lister.cache {
@@ -159,8 +166,14 @@ func (lister *pubsubMsgsLister) cleanup() {
 	}
 }
 
-func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.Logger) (*pubsubMsgsLister, error) {
-	ctx := context.Background()
+func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.Logger, contexts ...context.Context) (*pubsubMsgsLister, error) {
+	ctx, cancel := context.WithCancel(lifecycle.Context(contexts...))
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
 
 	var opts []option.ClientOption
 	if c.GetApiEndpoint() != "" {
@@ -172,6 +185,7 @@ func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.L
 		return nil, fmt.Errorf("pubsub.NewClient: %v", err)
 	}
 
+	context.AfterFunc(ctx, func() { client.Close() })
 	lister := &pubsubMsgsLister{
 		project: project,
 		c:       c,
@@ -182,10 +196,6 @@ func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.L
 		maxAge:  time.Hour,
 	}
 
-	// Start a cleanup goroutine to remove expired entries from the in-memory
-	// storage.
-	go lister.cleanup()
-
 	for _, sub := range lister.c.GetSubscription() {
 		s, err := lister.initSubscriber(ctx, sub)
 		if err != nil {
@@ -195,7 +205,11 @@ func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.L
 		name := sub.GetName()
 		lister.subs[name] = s
 		lister.cache[name] = make(map[string]time.Time)
+	}
 
+	// Initialize all caches before any receive callback can access them.
+	go lister.cleanup(ctx)
+	for name, s := range lister.subs {
 		lister.l.Infof("pubsub: Receiving pub/sub messages for project (%s) and subscription (%s)", lister.project, name)
 		go s.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 			lister.mu.Lock()
@@ -207,5 +221,6 @@ func newPubSubMsgsLister(project string, c *configpb.PubSubMessages, l *logger.L
 		})
 	}
 
+	success = true
 	return lister, nil
 }

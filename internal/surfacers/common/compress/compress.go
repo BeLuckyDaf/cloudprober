@@ -44,6 +44,8 @@ type CompressionBuffer struct {
 	// Cancel function for the internal context, to stop the compression and
 	// flushing loop.
 	cancelCtx context.CancelFunc
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewCompressionBuffer returns a new compression buffer.
@@ -55,21 +57,22 @@ func NewCompressionBuffer(inctx context.Context, callback func([]byte), batchSiz
 		batchSize: batchSize,
 		l:         l,
 		cancelCtx: cancel,
+		done:      make(chan struct{}),
 	}
 
 	// Start the flush loop: call flush every sec, until ctx.Done().
 	go func() {
+		defer close(c.done)
 		ticker := time.NewTicker(compressionBufferFlushInterval)
 		defer ticker.Stop()
 
-		for range ticker.C {
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-ticker.C:
+				c.compressAndCallback()
 			}
-
-			c.compressAndCallback()
 		}
 	}()
 
@@ -135,6 +138,9 @@ func (c *CompressionBuffer) compressAndCallback() {
 
 // Close compresses the buffer and flushes it to the output channel.
 func (c *CompressionBuffer) Close() {
-	c.cancelCtx()
-	c.compressAndCallback()
+	c.closeOnce.Do(func() {
+		c.cancelCtx()
+		<-c.done
+		c.compressAndCallback()
+	})
 }

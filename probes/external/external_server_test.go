@@ -16,6 +16,7 @@ package external
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -238,5 +239,34 @@ func TestProbeServerLocalPipeClose(t *testing.T) {
 	}
 	if _, ok := readError.(*os.PathError); !ok {
 		t.Errorf("Didn't get correct error in reading pipe. Got: %T, wanted: *os.PathError", readError)
+	}
+}
+
+func TestReadProbeRepliesExitsWithBlockedConsumer(t *testing.T) {
+	var input bytes.Buffer
+	for i := 0; i < 2; i++ {
+		if err := serverutils.WriteMessage(&configpb.ProbeReply{RequestId: proto.Int32(int32(i))}, &input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := &Probe{replyChan: make(chan *configpb.ProbeReply, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = p.readProbeRepliesFrom(ctx, &input) }()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for len(p.replyChan) == 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("reader never queued the first reply")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader remained blocked after cancellation")
 	}
 }

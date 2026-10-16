@@ -31,6 +31,7 @@ Kubernetes provider is configured through a protobuf based config file
 package kubernetes
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -156,6 +157,12 @@ func (p *Provider) ListResources(req *pb.ListResourcesRequest) (*pb.ListResource
 // New creates a Kubernetes (k8s) provider for RDS server, based on the
 // provided config.
 func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
+	return NewWithContext(context.Background(), c, l)
+}
+
+// NewWithContext creates a provider whose API calls and refresh workers stop
+// with ctx.
+func NewWithContext(ctx context.Context, c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 	// Guard the refresh loop's ticker, which panics on a non-positive
 	// interval. Note that an unset re_eval_sec defaults to 60, so this
 	// catches only an explicit zero or a negative value.
@@ -168,6 +175,8 @@ func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 		return nil, fmt.Errorf("error while creating the kubernetes client: %v", err)
 	}
 
+	client.ctx = ctx
+	context.AfterFunc(ctx, client.httpC.CloseIdleConnections)
 	p := &Provider{
 		listers: make(map[string]lister),
 	}

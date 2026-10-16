@@ -37,6 +37,7 @@ import (
 
 	"github.com/cloudprober/cloudprober/common/strtemplate"
 	"github.com/cloudprober/cloudprober/logger"
+	"github.com/cloudprober/cloudprober/probes/common/sched"
 	configpb "github.com/cloudprober/cloudprober/probes/external/proto"
 	"github.com/cloudprober/cloudprober/probes/external/serverutils"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
@@ -108,8 +109,11 @@ func (p *Probe) startCmdIfNotRunning(startCtx context.Context) error {
 		cmd.Env = append(cmd.Env, p.envVars...)
 	}
 
+	stderr := p.cmdStderr
+	p.cmdWorkers.Add(1)
 	go func() {
-		scanner := bufio.NewScanner(p.cmdStderr)
+		defer p.cmdWorkers.Done()
+		scanner := bufio.NewScanner(stderr)
 		rawStderr := p.c.GetRawStderrOutput()
 		for {
 			if scanner.Scan() {
@@ -123,7 +127,7 @@ func (p *Probe) startCmdIfNotRunning(startCtx context.Context) error {
 			if scanner.Err() == bufio.ErrTooLong {
 				// Drop the associated log but otherwise continue reading.
 				p.l.Errorf("stderr reader: encountered ErrTooLong from %s", cmd.Path)
-				scanner = bufio.NewScanner(p.cmdStderr)
+				scanner = bufio.NewScanner(stderr)
 				continue
 			}
 			p.l.Warningf("Stderr reader: encountered terminal error from %s: %v", cmd.Path, scanner.Err())
@@ -132,6 +136,11 @@ func (p *Probe) startCmdIfNotRunning(startCtx context.Context) error {
 	}()
 
 	if err = cmd.Start(); err != nil {
+		_ = p.cmdStdout.Close()
+		_ = p.cmdStderr.Close()
+		if stdin, ok := p.cmdStdin.(io.Closer); ok {
+			_ = stdin.Close()
+		}
 		p.l.Errorf("error while starting the cmd: %s %s. Err: %v", cmd.Path, cmd.Args, err)
 		return fmt.Errorf("error while starting the cmd: %s %s. Err: %v", cmd.Path, cmd.Args, err)
 	}
@@ -139,7 +148,9 @@ func (p *Probe) startCmdIfNotRunning(startCtx context.Context) error {
 	ctx, cancelReadProbeReplies := context.WithCancel(startCtx)
 	// This goroutine waits for the process to terminate and sets cmdRunning to
 	// false when that happens.
+	p.cmdWorkers.Add(2)
 	go func() {
+		defer p.cmdWorkers.Done()
 		if err := p.monitorCommand(startCtx, cmd); err != nil {
 			p.l.Error(err.Error())
 		}
@@ -148,13 +159,18 @@ func (p *Probe) startCmdIfNotRunning(startCtx context.Context) error {
 		p.cmdRunning = false
 		p.cmdRunningMu.Unlock()
 	}()
-	go p.readProbeReplies(ctx)
+	stdout := p.cmdStdout
+	go func() { defer p.cmdWorkers.Done(); _ = p.readProbeRepliesFrom(ctx, stdout) }()
 	p.cmdRunning = true
 	return nil
 }
 
 func (p *Probe) readProbeReplies(ctx context.Context) error {
-	bufReader := bufio.NewReader(p.cmdStdout)
+	return p.readProbeRepliesFrom(ctx, p.cmdStdout)
+}
+
+func (p *Probe) readProbeRepliesFrom(ctx context.Context, stdout io.Reader) error {
+	bufReader := bufio.NewReader(stdout)
 	// Start a background goroutine to read probe replies from the probe server
 	// process's stdout and put them on the probe's replyChan. Note that replyChan
 	// is a one element channel. Idea is that we won't need buffering other than
@@ -177,7 +193,11 @@ func (p *Probe) readProbeReplies(ctx context.Context) error {
 			p.l.Errorf("Error reading probe reply: %s", err.Error())
 			continue
 		}
-		p.replyChan <- rep
+		select {
+		case p.replyChan <- rep:
+		case <-ctx.Done():
+			return nil
+		}
 	}
 
 }
@@ -280,7 +300,9 @@ func (p *Probe) runServerProbe(ctx, startCtx context.Context) {
 		}
 		outstandingReqsMu.Unlock()
 		p.sendRequest(p.requestID, target)
-		time.Sleep(TimeBetweenRequests)
+		if !sched.WaitContext(ctx, TimeBetweenRequests) {
+			break
+		}
 	}
 
 	// Wait for receiver goroutine to exit.

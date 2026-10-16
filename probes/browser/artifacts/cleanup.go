@@ -90,7 +90,15 @@ func (ch *CleanupHandler) cleanupCycle() {
 
 func (ch *CleanupHandler) Start(ctx context.Context) {
 	ticker := time.NewTicker(ch.interval)
-	for ; true; <-ticker.C {
+	defer ticker.Stop()
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
 		select {
 		case <-ctx.Done():
 			ticker.Stop()

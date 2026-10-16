@@ -17,12 +17,12 @@ package gcp
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
 	configpb "github.com/cloudprober/cloudprober/internal/rds/gcp/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -43,6 +43,7 @@ type rtcVar struct {
 // cache, that's populated at a regular interval by making the GCP API calls.
 // Listing actually only returns the current contents of that cache.
 type rtcVariablesLister struct {
+	ctx        context.Context
 	project    string
 	c          *configpb.RTCVariables
 	apiVersion string
@@ -91,11 +92,13 @@ func (rvl *rtcVariablesLister) listResources(req *pb.ListResourcesRequest) ([]*p
 
 // defaultRTCService returns a compute.Service object, initialized using the
 // default credentials.
-func defaultRTCService() (*runtimeconfig.ProjectsConfigsVariablesService, error) {
-	client, err := google.DefaultClient(context.Background(), runtimeconfig.CloudruntimeconfigScope)
+func defaultRTCService(contexts ...context.Context) (*runtimeconfig.ProjectsConfigsVariablesService, error) {
+	ctx := lifecycle.Context(contexts...)
+	client, err := google.DefaultClient(ctx, runtimeconfig.CloudruntimeconfigScope)
 	if err != nil {
 		return nil, err
 	}
+	context.AfterFunc(ctx, client.CloseIdleConnections)
 	svc, err := runtimeconfig.New(client)
 	if err != nil {
 		return nil, err
@@ -126,7 +129,7 @@ func processVar(v *runtimeconfig.Variable) (*rtcVar, error) {
 // populates the cache.
 func (rvl *rtcVariablesLister) expand(rtcConfig *configpb.RTCVariables_RTCConfig, reEvalInterval time.Duration) {
 	path := "projects/" + rvl.project + "/configs/" + rtcConfig.GetName()
-	configVarsList, err := rvl.svc.List(path).Do()
+	configVarsList, err := rvl.svc.List(path).Context(lifecycle.Context(rvl.ctx)).Do()
 	if err != nil {
 		rvl.l.Errorf("rtc_variables.expand: error while getting list of all vars for config path %s: %v", path, err)
 		return
@@ -148,13 +151,20 @@ func (rvl *rtcVariablesLister) expand(rtcConfig *configpb.RTCVariables_RTCConfig
 	rvl.mu.Unlock()
 }
 
-func newRTCVariablesLister(project, apiVersion string, c *configpb.RTCVariables, l *logger.Logger) (*rtcVariablesLister, error) {
-	svc, err := defaultRTCService()
+func newRTCVariablesLister(project, apiVersion string, c *configpb.RTCVariables, l *logger.Logger, contexts ...context.Context) (*rtcVariablesLister, error) {
+	ctx := lifecycle.Context(contexts...)
+	for _, rtcConfig := range c.GetRtcConfig() {
+		if rtcConfig.GetReEvalSec() <= 0 {
+			return nil, fmt.Errorf("rtc_variables: re_eval_sec must be positive")
+		}
+	}
+	svc, err := defaultRTCService(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("rtc_variables.expand: error creating RTC service: %v", err)
 	}
 
 	rvl := &rtcVariablesLister{
+		ctx:        ctx,
 		project:    project,
 		c:          c,
 		apiVersion: apiVersion,
@@ -167,21 +177,7 @@ func newRTCVariablesLister(project, apiVersion string, c *configpb.RTCVariables,
 		rvl.l.Infof("rtc_variables.expand: expanding RTC vars for project (%s) and config (%s)", rvl.project, rtcConfig.GetName())
 
 		reEvalInterval := time.Duration(rtcConfig.GetReEvalSec()) * time.Second
-		go func(rtcConfig *configpb.RTCVariables_RTCConfig) {
-			rvl.expand(rtcConfig, 0)
-			// Introduce a random delay between 0-reEvalInterval before
-			// starting the refresh loop. If there are multiple cloudprober
-			// rtcVariables, this will make sure that each instance calls GCE
-			// API at a different point of time.
-			rand.Seed(time.Now().UnixNano())
-			randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-			time.Sleep(time.Duration(randomDelaySec) * time.Second)
-			ticker := time.NewTicker(reEvalInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				rvl.expand(rtcConfig, reEvalInterval)
-			}
-		}(rtcConfig)
+		go lifecycle.Run(ctx, reEvalInterval, func() { rvl.expand(rtcConfig, 0) }, func() { rvl.expand(rtcConfig, reEvalInterval) })
 	}
 	return rvl, nil
 }
