@@ -15,6 +15,8 @@
 package state
 
 import (
+	rdsserver "github.com/cloudprober/cloudprober/internal/rds/server"
+	"net/http"
 	"testing"
 	"time"
 
@@ -60,4 +62,33 @@ func TestLocalRDSServer(t *testing.T) {
 	if rds := LocalRDSServer(); rds != nil {
 		t.Fatalf("State has LocalRDSServer unexpectedly set. Got %v Want nil", rds)
 	}
+}
+
+func TestResetRuntime(t *testing.T) {
+	oldVersion, oldTimestamp, oldPath := Version(), BuildTimestamp(), ConfigFilePath()
+	t.Cleanup(func() {
+		ResetRuntime()
+		SetVersion(oldVersion)
+		SetBuildTimestamp(oldTimestamp)
+		SetConfigFilePath(oldPath)
+	})
+	timestamp := time.Now()
+	SetVersion("reload-test")
+	SetBuildTimestamp(timestamp)
+	SetConfigFilePath("config.textpb")
+	SetDefaultGRPCServer(grpc.NewServer())
+	SetLocalRDSServer(&rdsserver.Server{})
+	SetDefaultHTTPServeMux(http.NewServeMux())
+	assert.NoError(t, AddWebHandler("/old", func(http.ResponseWriter, *http.Request) {}, WithArtifactsLink("/artifact")))
+	ResetRuntime()
+	assert.Nil(t, DefaultGRPCServer())
+	assert.Nil(t, LocalRDSServer())
+	assert.Nil(t, DefaultHTTPServeMux())
+	assert.Empty(t, AllLinks())
+	assert.Empty(t, ArtifactsURLs())
+	assert.Equal(t, "reload-test", Version())
+	assert.Equal(t, timestamp, BuildTimestamp())
+	assert.Equal(t, "config.textpb", ConfigFilePath())
+	SetDefaultHTTPServeMux(http.NewServeMux())
+	assert.NoError(t, AddWebHandler("/old", func(http.ResponseWriter, *http.Request) {}))
 }

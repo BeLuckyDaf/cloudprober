@@ -26,6 +26,7 @@ import (
 	"github.com/cloudprober/cloudprober/internal/rds/file"
 	"github.com/cloudprober/cloudprober/internal/rds/gcp"
 	"github.com/cloudprober/cloudprober/internal/rds/kubernetes"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	spb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/server/proto"
@@ -35,6 +36,8 @@ import (
 
 // Server implements a ResourceDiscovery gRPC server.
 type Server struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
 	providers map[string]Provider
 	l         *logger.Logger
 
@@ -68,7 +71,7 @@ func (s *Server) initProviders(c *configpb.ServerConf) error {
 				id = file.DefaultProviderID
 			}
 			s.l.Infof("rds.server: adding file provider with id: %s", id)
-			if p, err = file.New(pc.GetFileConfig(), s.l); err != nil {
+			if p, err = file.NewWithContext(s.ctx, pc.GetFileConfig(), s.l); err != nil {
 				return err
 			}
 		case *configpb.Provider_GcpConfig:
@@ -76,7 +79,7 @@ func (s *Server) initProviders(c *configpb.ServerConf) error {
 				id = gcp.DefaultProviderID
 			}
 			s.l.Infof("rds.server: adding GCP provider with id: %s", id)
-			if p, err = gcp.New(pc.GetGcpConfig(), s.l); err != nil {
+			if p, err = gcp.NewWithContext(s.ctx, pc.GetGcpConfig(), s.l); err != nil {
 				return err
 			}
 		case *configpb.Provider_KubernetesConfig:
@@ -84,7 +87,7 @@ func (s *Server) initProviders(c *configpb.ServerConf) error {
 				id = kubernetes.DefaultProviderID
 			}
 			s.l.Infof("rds.server: adding Kubernetes provider with id: %s", id)
-			if p, err = kubernetes.New(pc.GetKubernetesConfig(), s.l); err != nil {
+			if p, err = kubernetes.NewWithContext(s.ctx, pc.GetKubernetesConfig(), s.l); err != nil {
 				return err
 			}
 		}
@@ -96,7 +99,10 @@ func (s *Server) initProviders(c *configpb.ServerConf) error {
 // New creates a new instance of the ResourceDiscovery Server using the server
 // conf.
 func New(initCtx context.Context, c *configpb.ServerConf, providers map[string]Provider, l *logger.Logger) (*Server, error) {
+	ctx, cancel := context.WithCancel(lifecycle.Context(initCtx))
 	srv := &Server{
+		ctx:       ctx,
+		cancel:    cancel,
 		providers: make(map[string]Provider),
 		l:         l,
 	}
@@ -104,6 +110,7 @@ func New(initCtx context.Context, c *configpb.ServerConf, providers map[string]P
 	var err error
 
 	if err = srv.initProviders(c); err != nil {
+		cancel()
 		return nil, err
 	}
 
@@ -118,4 +125,12 @@ func New(initCtx context.Context, c *configpb.ServerConf, providers map[string]P
 // RegisterWithGRPC registers the RDS servers with the given gRPC server.
 func (s *Server) RegisterWithGRPC(grpcServer *grpc.Server) {
 	spb.RegisterResourceDiscoveryServer(grpcServer, s)
+}
+
+// Close stops this server's resource discovery workers.
+func (s *Server) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	return nil
 }

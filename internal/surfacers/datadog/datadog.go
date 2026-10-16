@@ -20,7 +20,6 @@ package datadog
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	configpb "github.com/cloudprober/cloudprober/internal/surfacers/datadog/proto"
@@ -45,6 +44,8 @@ var datadogKind = map[metrics.Kind]string{
 
 // DDSurfacer implements a datadog surfacer for datadog metrics.
 type DDSurfacer struct {
+	cancel    context.CancelFunc
+	done      chan struct{}
 	c         *configpb.SurfacerConf
 	opts      *options.Options
 	writeChan chan *metrics.EventMetrics
@@ -59,20 +60,17 @@ type DDSurfacer struct {
 // New creates a new instance of a datadog surfacer, based on the config passed in. It then hands off
 // to a goroutine to surface metrics to datadog across a buffered channel.
 func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Options, l *logger.Logger) (*DDSurfacer, error) {
-	if config.GetApiKey() != "" {
-		os.Setenv("DD_API_KEY", config.GetApiKey())
+	if config.GetMetricsBatchSize() <= 0 || config.GetBatchTimerSec() <= 0 {
+		return nil, fmt.Errorf("invalid datadog surfacer buffer, batch size, or export interval")
 	}
-	if config.GetAppKey() != "" {
-		os.Setenv("DD_APP_KEY", config.GetAppKey())
-	}
-
 	p := config.GetPrefix()
-	if p[len(p)-1] != '.' {
+	if p != "" && p[len(p)-1] != '.' {
 		p += "."
 	}
 
 	dd := &DDSurfacer{
 		c:             config,
+		opts:          opts,
 		writeChan:     make(chan *metrics.EventMetrics, config.GetMetricsBatchSize()),
 		client:        newClient(config.GetServer(), config.GetApiKey(), config.GetAppKey(), config.GetDisableCompression()),
 		l:             l,
@@ -80,10 +78,26 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		ddSeriesCache: make([]ddSeries, 0, config.GetMetricsBatchSize()),
 	}
 
-	go dd.receiveMetricsFromEvent(ctx)
+	ctx, dd.cancel = context.WithCancel(ctx)
+	dd.done = make(chan struct{})
+	go func() {
+		defer close(dd.done)
+		dd.receiveMetricsFromEvent(ctx)
+	}()
 
 	dd.l.Info("Initialised Datadog surfacer")
 	return dd, nil
+}
+
+// Close stops the exporter and waits for in-flight writes to finish.
+func (dd *DDSurfacer) Close() error {
+	if dd.cancel != nil {
+		dd.cancel()
+	}
+	if dd.done != nil {
+		<-dd.done
+	}
+	return nil
 }
 
 // Write is a function defined to comply with the surfacer interface, and enables the

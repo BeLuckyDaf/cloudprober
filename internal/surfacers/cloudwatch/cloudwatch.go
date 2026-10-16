@@ -19,6 +19,7 @@ package cloudwatch
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -39,6 +40,8 @@ const distributionDimensionName string = "le"
 
 // CWSurfacer implements AWS Cloudwatch surfacer.
 type CWSurfacer struct {
+	cancel    context.CancelFunc
+	done      chan struct{}
 	c         *configpb.SurfacerConf
 	opts      *options.Options
 	writeChan chan *metrics.EventMetrics
@@ -54,6 +57,9 @@ type CWSurfacer struct {
 // passed in. It then hands off to a goroutine to surface metrics to cloudwatch
 // across a buffered channel.
 func New(ctx context.Context, conf *configpb.SurfacerConf, opts *options.Options, l *logger.Logger) (*CWSurfacer, error) {
+	if conf.GetMetricsBatchSize() <= 0 || conf.GetBatchTimerSec() <= 0 {
+		return nil, fmt.Errorf("invalid cloudwatch surfacer buffer, batch size, or export interval")
+	}
 	region := getRegion(conf)
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
@@ -70,10 +76,26 @@ func New(ctx context.Context, conf *configpb.SurfacerConf, opts *options.Options
 		metricDatumCache: make([]types.MetricDatum, 0, int(conf.GetMetricsBatchSize())), // batching buffer between cloudprober and cloudwatch
 	}
 
-	go cw.processIncomingMetrics(ctx)
+	ctx, cw.cancel = context.WithCancel(ctx)
+	cw.done = make(chan struct{})
+	go func() {
+		defer close(cw.done)
+		cw.processIncomingMetrics(ctx)
+	}()
 
 	cw.l.Infof("Initialised Cloudwatch surfacer with batchsize: %d, publish timer (secs): %d\n", conf.GetMetricsBatchSize(), conf.GetBatchTimerSec())
 	return cw, nil
+}
+
+// Close stops the exporter and waits for in-flight writes to finish.
+func (cw *CWSurfacer) Close() error {
+	if cw.cancel != nil {
+		cw.cancel()
+	}
+	if cw.done != nil {
+		<-cw.done
+	}
+	return nil
 }
 
 // Write is a function defined to comply with the surfacer interface, and enables the

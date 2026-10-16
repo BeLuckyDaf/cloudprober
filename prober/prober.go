@@ -25,6 +25,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"regexp"
@@ -59,13 +60,23 @@ var (
 
 // Prober represents a collection of probes where each probe implements the Probe interface.
 type Prober struct {
-	Probes    map[string]*probes.ProbeInfo
-	Servers   []*servers.ServerInfo
-	c         *configpb.ProberConfig
-	l         *logger.Logger
-	mu        sync.RWMutex
-	ldLister  endpoint.Lister
-	Surfacers []*surfacers.SurfacerInfo
+	Probes         map[string]*probes.ProbeInfo
+	Servers        []*servers.ServerInfo
+	c              *configpb.ProberConfig
+	l              *logger.Logger
+	mu             sync.RWMutex
+	operations     sync.RWMutex
+	workers        sync.WaitGroup
+	dispatcher     sync.WaitGroup
+	cancelDispatch context.CancelFunc
+	stopped        bool
+	stopDone       chan struct{}
+	initCtx        context.Context
+	cancelInit     context.CancelFunc
+	cancelStart    context.CancelFunc
+	reloadConfig   func(context.Context) error
+	ldLister       endpoint.Lister
+	Surfacers      []*surfacers.SurfacerInfo
 
 	// Cached reference to the probestatus surfacer for gRPC queries.
 	probeStatusSurfacer *probestatus.Surfacer
@@ -102,6 +113,10 @@ func (pr *Prober) addProbe(p *probes_configpb.ProbeDef) error {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
+	if pr.stopped {
+		return status.Error(codes.FailedPrecondition, "prober stopped")
+	}
+
 	// Check if this probe is supposed to run here.
 	runHere, err := runOnThisHost(p.GetRunOn(), sysvars.GetVar("hostname"))
 	if err != nil {
@@ -115,7 +130,7 @@ func (pr *Prober) addProbe(p *probes_configpb.ProbeDef) error {
 		return status.Errorf(codes.AlreadyExists, "probe %s is already defined", p.GetName())
 	}
 
-	opts, err := options.BuildProbeOptions(p, pr.ldLister, pr.c, pr.l)
+	opts, err := options.BuildProbeOptionsWithContext(pr.initCtx, p, pr.ldLister, pr.c, pr.l)
 	if err != nil {
 		return status.Error(codes.Unknown, err.Error())
 	}
@@ -159,21 +174,38 @@ func (pr *Prober) warnLatencyTypeClash(probeName string) {
 func (pr *Prober) startProbe(name string) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
+	pr.startProbeLocked(pr.Probes[name])
+}
 
+// startProbeLocked checks identity as a jittered start may refer to a probe
+// that has since been removed and replaced.
+func (pr *Prober) startProbeLocked(p *probes.ProbeInfo) {
+	if p == nil || pr.stopped || pr.startCtx == nil || pr.startCtx.Err() != nil || pr.Probes[p.Name] != p || pr.probeCancelFunc[p.Name] != nil {
+		return
+	}
 	probeCtx, cancelFunc := context.WithCancel(pr.startCtx)
-	pr.probeCancelFunc[name] = cancelFunc
-
-	p := pr.Probes[name]
+	pr.probeCancelFunc[p.Name] = cancelFunc
+	pr.workers.Add(1)
 	go func() {
+		defer pr.workers.Done()
 		if delay := p.ProbeDef.GetStartupDelayMsec(); delay > 0 {
-			select {
-			case <-probeCtx.Done():
+			if !waitForContext(probeCtx, time.Duration(delay)*time.Millisecond) {
 				return
-			case <-time.After(time.Duration(delay) * time.Millisecond):
 			}
 		}
 		p.Start(probeCtx, pr.dataChan)
 	}()
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
 }
 
 func randomDuration(duration time.Duration) time.Duration {
@@ -233,19 +265,27 @@ func (pr *Prober) startProbesWithJitter() {
 	for interval, probeInfos := range intervalBuckets {
 		// Note that we introduce jitter within the goroutine instead of in the
 		// loop here. This is to make sure this function returns quickly.
+		pr.workers.Add(1)
 		go func(interval time.Duration, probeInfos []*probes.ProbeInfo, iter int) {
+			defer pr.workers.Done()
 			if iter > 0 {
 				// Except for the first interval bucket, we sleep before
 				// starting probes in this bucket. This sleep is for a random
 				// duration <= min(interval, 1min). Note that unlike inter-probe
 				// gap this one doesn't add up.
-				time.Sleep(randomDuration(interval))
+				if !waitForContext(pr.startCtx, randomDuration(interval)) {
+					return
+				}
 			}
 
 			for _, p := range probeInfos {
 				pr.l.Info("Starting probe: ", p.Name)
-				go pr.startProbe(p.Name)
-				time.Sleep(interProbeGap(interval, len(probeInfos)))
+				pr.mu.Lock()
+				pr.startProbeLocked(p)
+				pr.mu.Unlock()
+				if !waitForContext(pr.startCtx, interProbeGap(interval, len(probeInfos))) {
+					return
+				}
 			}
 		}(interval, probeInfos, iter)
 		iter++
@@ -254,12 +294,32 @@ func (pr *Prober) startProbesWithJitter() {
 
 // Run runs requested 'probeNames' once.
 func (pr *Prober) Run(ctx context.Context, probeNames []string) (map[string][]*singlerun.ProbeRunResult, error) {
+	pr.operations.RLock()
+	defer pr.operations.RUnlock()
 	pr.mu.RLock()
-	defer pr.mu.RUnlock()
+	if pr.stopped {
+		pr.mu.RUnlock()
+		return nil, status.Error(codes.FailedPrecondition, "prober stopped")
+	}
+	probeSnapshot := make(map[string]*probes.ProbeInfo, len(pr.Probes))
+	for name, p := range pr.Probes {
+		probeSnapshot[name] = p
+	}
+	startCtx := pr.startCtx
+	if startCtx == nil {
+		startCtx = pr.initCtx
+	}
+	pr.mu.RUnlock()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if startCtx != nil {
+		stop := context.AfterFunc(startCtx, cancel)
+		defer stop()
+	}
 
 	for _, wanted := range probeNames {
 		missing := make([]string, 0)
-		if _, ok := pr.Probes[wanted]; !ok {
+		if _, ok := probeSnapshot[wanted]; !ok {
 			missing = append(missing, wanted)
 		}
 		if len(missing) > 0 {
@@ -271,11 +331,11 @@ func (pr *Prober) Run(ctx context.Context, probeNames []string) (map[string][]*s
 	var outMu sync.Mutex
 
 	var wg sync.WaitGroup
-	for name := range pr.Probes {
+	for name := range probeSnapshot {
 		if len(probeNames) > 0 && !slices.Contains(probeNames, name) {
 			continue
 		}
-		p, ok := pr.Probes[name].Probe.(probes.ProbeWithRunOnce)
+		p, ok := probeSnapshot[name].Probe.(probes.ProbeWithRunOnce)
 		if !ok {
 			pr.l.Warningf("probe %s doesn't support single run", name)
 			continue
@@ -304,48 +364,129 @@ func (pr *Prober) Run(ctx context.Context, probeNames []string) (map[string][]*s
 // Start is unprotected and should never be called concurrently. It's called
 // once from the main function, never in response to a gRPC request.
 func (pr *Prober) Start(ctx context.Context) {
-	pr.startCtx = ctx
-
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	if pr.stopped || pr.startCtx != nil {
+		return
+	}
+	pr.startCtx, pr.cancelStart = context.WithCancel(ctx)
+	ctx = pr.startCtx
 	pr.dataChan = make(chan *metrics.EventMetrics, 100000)
 
+	dispatchCtx, cancelDispatch := context.WithCancel(context.Background())
+	pr.cancelDispatch = cancelDispatch
+	pr.dispatcher.Add(1)
 	go func() {
-		var em *metrics.EventMetrics
+		defer pr.dispatcher.Done()
 		for {
-			em = <-pr.dataChan
-
-			// Replicate the surfacer message to every surfacer we have
-			// registered. Note that s.Write() is expected to be
-			// non-blocking to avoid blocking of EventMetrics message
-			// processing.
-			for _, surfacer := range pr.Surfacers {
-				surfacer.Write(pr.startCtx, em)
+			select {
+			case <-dispatchCtx.Done():
+				return
+			case em := <-pr.dataChan:
+				for _, surfacer := range pr.Surfacers {
+					surfacer.Write(ctx, em)
+				}
 			}
 		}
 	}()
 
-	// Start a goroutine to export system variables
-	go sysvars.Start(ctx, pr.dataChan, time.Millisecond*time.Duration(pr.c.GetSysvarsIntervalMsec()), pr.c.GetSysvarsEnvVar())
-
-	// Start servers, each in its own goroutine
+	pr.workers.Add(1)
+	go func() {
+		defer pr.workers.Done()
+		sysvars.Start(ctx, pr.dataChan, time.Millisecond*time.Duration(pr.c.GetSysvarsIntervalMsec()), pr.c.GetSysvarsEnvVar())
+	}()
 	for _, s := range pr.Servers {
-		go s.Start(ctx, pr.dataChan)
+		pr.workers.Add(1)
+		go func(s *servers.ServerInfo) { defer pr.workers.Done(); s.Start(ctx, pr.dataChan) }(s)
 	}
-
 	if pr.c.GetDisableJitter() {
-		for name := range pr.Probes {
-			go pr.startProbe(name)
+		for _, p := range pr.Probes {
+			pr.startProbeLocked(p)
 		}
 	} else {
 		pr.startProbesWithJitter()
 	}
 }
 
+// Stop prevents further API changes, cancels all workers, and releases probe
+// resources, including probes initialized but not yet started. It is idempotent.
+func (pr *Prober) Stop() {
+	pr.mu.Lock()
+	if pr.stopped {
+		done := pr.stopDone
+		pr.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return
+	}
+	pr.stopped = true
+	pr.stopDone = make(chan struct{})
+	if pr.cancelStart != nil {
+		pr.cancelStart()
+	}
+	if pr.cancelInit != nil {
+		pr.cancelInit()
+	}
+	for _, cancel := range pr.probeCancelFunc {
+		cancel()
+	}
+	pr.mu.Unlock()
+
+	pr.operations.Lock()
+	defer pr.operations.Unlock()
+	for _, p := range pr.Probes {
+		closeProbe(p)
+	}
+	for _, s := range pr.Servers {
+		_ = s.Close()
+	}
+	pr.workers.Wait()
+	if pr.cancelDispatch != nil {
+		pr.cancelDispatch()
+	}
+	pr.dispatcher.Wait()
+	for _, s := range pr.Surfacers {
+		_ = s.Close()
+	}
+	close(pr.stopDone)
+}
+
+func closeProbe(p *probes.ProbeInfo) {
+	if c, ok := p.Probe.(io.Closer); ok {
+		_ = c.Close()
+	}
+}
+
+// SnapshotInfo returns an independent collection snapshot for status readers.
+func (pr *Prober) SnapshotInfo() (map[string]*probes.ProbeInfo, []*surfacers.SurfacerInfo, []*servers.ServerInfo) {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	ps := make(map[string]*probes.ProbeInfo, len(pr.Probes))
+	for name, p := range pr.Probes {
+		ps[name] = p
+	}
+	return ps, slices.Clone(pr.Surfacers), slices.Clone(pr.Servers)
+}
+
+// SetReloadConfigFunc installs the owner callback used by the ReloadConfig RPC.
+func (pr *Prober) SetReloadConfigFunc(f func(context.Context) error) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	pr.reloadConfig = f
+}
+
 // Init initialize prober with the given config file.
 func Init(ctx context.Context, cfg *configpb.ProberConfig, l *logger.Logger) (*Prober, error) {
-	pr := &Prober{
-		c: cfg,
-		l: l,
-	}
+	initCtx, cancelInit := context.WithCancel(ctx)
+	ctx = initCtx
+	pr := &Prober{c: cfg, l: l, initCtx: initCtx, cancelInit: cancelInit}
+	initialized := false
+	defer func() {
+		if !initialized {
+			pr.Stop()
+		}
+	}()
 
 	// Initialize cloudprober gRPC service if configured.
 	srv := state.DefaultGRPCServer()
@@ -375,7 +516,7 @@ func Init(ctx context.Context, cfg *configpb.ProberConfig, l *logger.Logger) (*P
 	if globalTargetsOpts.GetLameDuckOptions() != nil {
 		ldLogger := logger.NewWithAttrs(slog.String("component", "lame-duck"))
 
-		if err := lameduck.InitDefaultLister(globalTargetsOpts, nil, ldLogger); err != nil {
+		if err := lameduck.InitDefaultListerWithContext(ctx, globalTargetsOpts, nil, ldLogger); err != nil {
 			return nil, err
 		}
 
@@ -390,7 +531,7 @@ func Init(ctx context.Context, cfg *configpb.ProberConfig, l *logger.Logger) (*P
 
 	// Initialize shared targets
 	for _, st := range pr.c.GetSharedTargets() {
-		tgts, err := targets.New(st.GetTargets(), pr.ldLister, globalTargetsOpts, pr.l, pr.l)
+		tgts, err := targets.NewWithContext(ctx, st.GetTargets(), pr.ldLister, globalTargetsOpts, pr.l, pr.l)
 		if err != nil {
 			return nil, err
 		}
@@ -427,6 +568,13 @@ func Init(ctx context.Context, cfg *configpb.ProberConfig, l *logger.Logger) (*P
 	}
 
 	pr.warnLatencyTypeClash("")
-
+	for _, server := range pr.Servers {
+		if preparer, ok := server.Server.(interface{ Prepare(context.Context) error }); ok {
+			if err := preparer.Prepare(ctx); err != nil {
+				return nil, fmt.Errorf("error preparing server %s: %w", server.Type, err)
+			}
+		}
+	}
+	initialized = true
 	return pr, nil
 }

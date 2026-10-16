@@ -17,6 +17,7 @@ package artifacts
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -26,10 +27,13 @@ import (
 	"github.com/cloudprober/cloudprober/probes/browser/artifacts/storage"
 	"github.com/cloudprober/cloudprober/probes/browser/artifacts/web"
 	"github.com/cloudprober/cloudprober/probes/options"
+	"github.com/cloudprober/cloudprober/state"
 	"google.golang.org/protobuf/proto"
 )
 
 var initGlobalServingOnce sync.Once
+var globalServingMu sync.Mutex
+var globalServingMux *http.ServeMux
 
 type ArtifactsHandler struct {
 	destPathFn func(string) string
@@ -89,6 +93,12 @@ func initGlobalArtifactsServing(opts *configpb.ArtifactsOptions, l *logger.Logge
 		return nil
 	}
 
+	globalServingMu.Lock()
+	defer globalServingMu.Unlock()
+	if mux := state.DefaultHTTPServeMux(); mux != globalServingMux {
+		initGlobalServingOnce = sync.Once{}
+		globalServingMux = mux
+	}
 	var err error
 	initGlobalServingOnce.Do(func() {
 		var webRoot string

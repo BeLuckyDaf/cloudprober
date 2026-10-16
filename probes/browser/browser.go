@@ -566,7 +566,9 @@ func (p *Probe) runProbe(ctx context.Context, runReq *sched.RunProbeForTargetReq
 		go func(reqNum int) {
 			defer wg.Done()
 
-			time.Sleep(time.Duration(reqNum*int(p.c.GetRequestsIntervalMsec())) * time.Millisecond)
+			if !sched.WaitContext(ctx, time.Duration(reqNum*int(p.c.GetRequestsIntervalMsec()))*time.Millisecond) {
+				return
+			}
 			p.runPWTest(ctx, runReq, &resultMu)
 		}(i)
 	}

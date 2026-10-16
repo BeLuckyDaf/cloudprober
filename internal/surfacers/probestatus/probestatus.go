@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudprober/cloudprober/internal/surfacers/common/response"
 	configpb "github.com/cloudprober/cloudprober/internal/surfacers/probestatus/proto"
 	"github.com/cloudprober/cloudprober/internal/sysvars"
 	"github.com/cloudprober/cloudprober/logger"
@@ -124,6 +125,9 @@ func (pc *pageCache) setContent(url string, content []byte) {
 
 // Surfacer implements a status surfacer for Cloudprober.
 type Surfacer struct {
+	cancel        context.CancelFunc
+	runtimeDone   <-chan struct{}
+	done          chan struct{}
 	c             *configpb.SurfacerConf // Configuration
 	opts          *options.Options
 	emChan        chan *metrics.EventMetrics // Buffered channel to store incoming EventMetrics
@@ -157,6 +161,9 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		return nil, nil
 	}
 
+	if config.GetResolutionSec() < 0 || config.GetTimeseriesSize() <= 0 {
+		return nil, fmt.Errorf("probestatus resolution cannot be negative and timeseries_size must be positive")
+	}
 	res := time.Duration(config.GetResolutionSec()) * time.Second
 	if res == 0 {
 		res = time.Minute
@@ -166,7 +173,10 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		l.Warningf("Setting status page url is deprecated. In future versions, url will always be fixed at /status and setting it to anything else will result in an error")
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
 	ps := &Surfacer{
+		cancel:        cancel,
+		runtimeDone:   ctx.Done(),
 		c:             config,
 		opts:          opts,
 		emChan:        make(chan *metrics.EventMetrics, metricsBufferSize),
@@ -180,13 +190,22 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		l:          l,
 	}
 
+	initialized := false
+	defer func() {
+		if !initialized {
+			ps.Close()
+		}
+	}()
+
 	ps.dashDurations, ps.dashDurationsText = dashboardDurations(ps.resolution * time.Duration(ps.c.GetTimeseriesSize()))
 	ps.pageCache = newPageCache(int(ps.c.GetCacheTimeSec()))
 
 	// Start a goroutine to process the incoming EventMetrics as well as
 	// the incoming web queries. To avoid data access race conditions, we do
 	// one thing at a time.
+	ps.done = make(chan struct{})
 	go func() {
+		defer close(ps.done)
 		for {
 			select {
 			case <-ctx.Done():
@@ -203,13 +222,33 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 		}
 	}()
 
-	state.AddWebHandler(config.GetUrl(), func(w http.ResponseWriter, r *http.Request) {
+	if err := state.AddWebHandler(config.GetUrl(), func(w http.ResponseWriter, r *http.Request) {
 		// doneChan is used to track the completion of the response writing. This is
 		// required as response is written in a different goroutine.
-		doneChan := make(chan struct{}, 1)
-		ps.queryChan <- &httpWriter{w, r, doneChan}
-		<-doneChan
-	})
+		if ctx.Err() != nil {
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+			return
+		}
+		buffered := response.New()
+		doneChan := make(chan struct{})
+		select {
+		case ps.queryChan <- &httpWriter{buffered, r, doneChan}:
+		case <-ctx.Done():
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			return
+		}
+		select {
+		case <-doneChan:
+			buffered.WriteTo(w)
+		case <-ctx.Done():
+			http.Error(w, "configuration is being reloaded", http.StatusServiceUnavailable)
+		case <-r.Context().Done():
+		}
+	}); err != nil {
+		return nil, err
+	}
 
 	redirectHTML := fmt.Sprintf(`<html><meta http-equiv="refresh" content="0; url=%s"></html>`, strings.TrimLeft(config.GetUrl(), "/"))
 
@@ -240,6 +279,7 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 	}
 
 	l.Infof("Initialized status surfacer at the URL: %s", config.GetUrl())
+	initialized = true
 	return ps, nil
 }
 
@@ -303,6 +343,8 @@ func (ps *Surfacer) QueryStatus(ctx context.Context, probeNames []string, endTim
 
 	select {
 	case ps.statusQueryCh <- sq:
+	case <-ps.runtimeDone:
+		return nil, context.Canceled
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -310,9 +352,25 @@ func (ps *Surfacer) QueryStatus(ctx context.Context, probeNames []string, endTim
 	select {
 	case result := <-sq.resultChan:
 		return result, nil
+	case <-ps.runtimeDone:
+		return nil, context.Canceled
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// Close stops the worker and waits for queued response processing to stop.
+func (ps *Surfacer) Close() error {
+	if ps == nil {
+		return nil
+	}
+	if ps.cancel != nil {
+		ps.cancel()
+	}
+	if ps.done != nil {
+		<-ps.done
+	}
+	return nil
 }
 
 // Write queues the incoming data into a channel. This channel is watched by a

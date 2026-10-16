@@ -577,9 +577,18 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 	s.UpdateTargetsAndStartProbes(ctx)
 
 	// We'll come here when context is cancelled, clean up connections.
-	for _, conn := range p.conns {
+	_ = p.Close()
+}
+
+// Close releases cached connections, including connections opened by RunOnce.
+func (p *Probe) Close() error {
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
+	for key, conn := range p.conns {
 		if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
+		delete(p.conns, key)
 	}
+	return nil
 }

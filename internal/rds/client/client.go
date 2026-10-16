@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -31,6 +30,7 @@ import (
 	"github.com/cloudprober/cloudprober/common/oauth"
 	"github.com/cloudprober/cloudprober/common/tlsconfig"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/client/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	spb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/logger"
@@ -62,6 +62,11 @@ const defaultRDSPort = "9314"
 
 // Client represents an RDS based client instance.
 type Client struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	conn          *grpc.ClientConn
+	done          chan struct{}
+	refreshMu     sync.Mutex
 	mu            sync.RWMutex
 	c             *configpb.ClientConf
 	serverOpts    *configpb.ClientConf_ServerOptions
@@ -80,11 +85,21 @@ type ListResourcesFunc func(context.Context, *pb.ListResourcesRequest) (*pb.List
 
 // refreshState refreshes the client cache.
 func (client *Client) refreshState(timeout time.Duration) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
+	client.refreshMu.Lock()
+	defer client.refreshMu.Unlock()
+	ctx, cancelFunc := context.WithTimeout(lifecycle.Context(client.ctx), timeout)
 	defer cancelFunc()
 
-	req := client.c.GetRequest()
+	if ctx.Err() != nil {
+		return
+	}
+	req := &pb.ListResourcesRequest{}
+	if client.c.GetRequest() != nil {
+		req = proto.Clone(client.c.GetRequest()).(*pb.ListResourcesRequest)
+	}
+	client.mu.RLock()
 	req.IfModifiedSince = proto.Int64(client.lastModified)
+	client.mu.RUnlock()
 
 	response, err := client.listResources(ctx, req)
 	if err != nil {
@@ -236,6 +251,7 @@ func (client *Client) initListResourcesFunc() error {
 		return fmt.Errorf("rds/client: error connecting to server (%v): %v", client.serverOpts.GetServerAddress(), err)
 	}
 
+	client.conn = conn
 	client.listResources = func(ctx context.Context, in *pb.ListResourcesRequest) (*pb.ListResourcesResponse, error) {
 		return spb.NewResourceDiscoveryClient(conn).ListResources(ctx, in)
 	}
@@ -246,7 +262,17 @@ func (client *Client) initListResourcesFunc() error {
 // New creates an RDS (ResourceDiscovery service) client instance and set it up
 // for continuous refresh.
 func New(c *configpb.ClientConf, listResources ListResourcesFunc, l *logger.Logger) (*Client, error) {
+	return NewWithContext(context.Background(), c, listResources, l)
+}
+
+// NewWithContext creates a client whose requests, refresh loop and connection
+// are stopped when ctx is cancelled.
+func NewWithContext(ctx context.Context, c *configpb.ClientConf, listResources ListResourcesFunc, l *logger.Logger) (*Client, error) {
+	ctx, cancel := context.WithCancel(lifecycle.Context(ctx))
 	client := &Client{
+		ctx:           ctx,
+		cancel:        cancel,
+		done:          make(chan struct{}),
 		c:             c,
 		serverOpts:    c.GetServerOptions(),
 		cache:         make(map[string]*cacheRecord),
@@ -256,28 +282,23 @@ func New(c *configpb.ClientConf, listResources ListResourcesFunc, l *logger.Logg
 	}
 
 	if err := client.initListResourcesFunc(); err != nil {
+		cancel()
 		return nil, fmt.Errorf("rds/client: error initializing listListResource function: %v", err)
 	}
 
+	if client.conn != nil {
+		context.AfterFunc(ctx, func() { client.conn.Close() })
+	}
 	if client.c.GetReEvalSec() <= 0 {
+		close(client.done)
 		return client, nil
 	}
 
 	reEvalInterval := time.Duration(client.c.GetReEvalSec()) * time.Second
 	client.refreshState(reEvalInterval)
 	go func() {
-		// Introduce a random delay between 0-reEvalInterval before starting the
-		// refreshState loop. If there are multiple cloudprober instances, this will
-		// make sure that each instance calls RDS server at a different point of
-		// time.
-		rand.Seed(time.Now().UnixNano())
-		randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-		time.Sleep(time.Duration(randomDelaySec) * time.Second)
-		ticker := time.NewTicker(reEvalInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			client.refreshState(reEvalInterval)
-		}
+		defer close(client.done)
+		lifecycle.Run(ctx, reEvalInterval, nil, func() { client.refreshState(reEvalInterval) })
 	}()
 
 	return client, nil
@@ -286,4 +307,19 @@ func New(c *configpb.ClientConf, listResources ListResourcesFunc, l *logger.Logg
 // init initializes the package by creating a new global resolver.
 func init() {
 	globalResolver = dnsRes.New()
+}
+
+// Close stops background refreshes and closes the owned connection. It is safe
+// to call more than once.
+func (client *Client) Close() error {
+	if client.cancel != nil {
+		client.cancel()
+	}
+	if client.conn != nil {
+		client.conn.Close()
+	}
+	if client.done != nil {
+		<-client.done
+	}
+	return nil
 }

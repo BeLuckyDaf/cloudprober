@@ -47,6 +47,8 @@ type Surfacer struct {
 
 	// Channel for incoming data.
 	writeChan chan *metrics.EventMetrics
+	cancel    context.CancelFunc
+	done      chan struct{}
 
 	// Cloud logger
 	l *logger.Logger
@@ -60,12 +62,26 @@ type Surfacer struct {
 // into a bigquery database.
 // ctx is used to manage background goroutine.
 func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Options, l *logger.Logger) (*Surfacer, error) {
+	if config.GetBatchTimerSec() <= 0 || config.GetBatchTimerSec() > int64(time.Duration(1<<63-1)/time.Second) || config.GetMetricsBatchSize() <= 0 || config.GetMetricsBufferSize() < 0 {
+		return nil, fmt.Errorf("invalid bigquery surfacer buffer, batch size, or export interval")
+	}
 	s := &Surfacer{
 		c:    config,
 		opts: opts,
 		l:    l,
 	}
 	return s, s.init(ctx)
+}
+
+// Close stops the exporter and waits for its client to be released.
+func (s *Surfacer) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.done != nil {
+		<-s.done
+	}
+	return nil
 }
 
 func (row *bqrow) Save() (map[string]bigquery.Value, string, error) {
@@ -364,6 +380,9 @@ func (s *Surfacer) writeToBQ(ctx context.Context, inserter iInserter) {
 	for {
 		select {
 		case <-ctx.Done():
+			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			s.batchInsertRowsToBQ(flushCtx, inserter)
+			cancel()
 			s.l.Infof("Context canceled, stopping the surfacer write loop")
 			return
 		case <-ticker.C:
@@ -373,6 +392,7 @@ func (s *Surfacer) writeToBQ(ctx context.Context, inserter iInserter) {
 }
 
 func (s *Surfacer) init(ctx context.Context) error {
+	ctx, s.cancel = context.WithCancel(ctx)
 	s.writeChan = make(chan *metrics.EventMetrics, s.c.GetMetricsBufferSize())
 
 	if s.c.GetWideRows() {
@@ -395,16 +415,19 @@ func (s *Surfacer) init(ctx context.Context) error {
 		s.l.Errorf("bigquery client can't be created: %v", err)
 		return err
 	}
-	defer client.Close()
 
 	inserter := client.Dataset(s.c.GetBigqueryDataset()).Table(s.c.GetBigqueryTable()).Inserter()
 	if inserter == nil {
+		client.Close()
 		return fmt.Errorf("error bigquery inserter cannot be created")
 	}
 
 	// Start a goroutine to run forever, polling on the writeChan. Allows
 	// for the surfacer to write asynchronously to the serial port.
+	s.done = make(chan struct{})
 	go func() {
+		defer close(s.done)
+		defer client.Close()
 		s.writeToBQ(ctx, inserter)
 	}()
 

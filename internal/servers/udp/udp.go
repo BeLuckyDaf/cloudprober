@@ -94,10 +94,6 @@ func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Se
 	if err != nil {
 		return nil, err
 	}
-	go func() {
-		<-initCtx.Done()
-		conn.Close()
-	}()
 
 	s := &Server{
 		c:              c,
@@ -106,7 +102,24 @@ func New(initCtx context.Context, c *configpb.ServerConf, l *logger.Logger) (*Se
 		maxPayloadSize: int(maxPayloadSize),
 	}
 
-	return s, s.configureAdvancedReadWrite()
+	if err := s.configureAdvancedReadWrite(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	context.AfterFunc(initCtx, func() { s.Close() })
+	return s, nil
+}
+
+// Close releases the UDP socket synchronously.
+func (s *Server) Close() error {
+	if s.conn == nil {
+		return nil
+	}
+	err := s.conn.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 // Listen opens a UDP socket on the given port. It also attempts to set recv
@@ -225,10 +238,9 @@ func (s *Server) Start(ctx context.Context, dataChan chan<- *metrics.EventMetric
 	// Typically, this is not what we want (close something started outside of
 	// Start function), but in case of UDP we don't have better control than
 	// this. One thing we can consider is to re-setup connection in Start().
-	go func() {
-		<-ctx.Done()
-		s.conn.Close()
-	}()
+	stopClose := context.AfterFunc(ctx, func() { s.Close() })
+	defer stopClose()
+	defer s.Close()
 
 	switch s.c.GetType() {
 

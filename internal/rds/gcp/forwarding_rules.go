@@ -26,6 +26,7 @@ import (
 	"time"
 
 	configpb "github.com/cloudprober/cloudprober/internal/rds/gcp/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -62,6 +63,7 @@ var ForwardingRulesFilters = struct {
 // that's populated at a regular interval by making the GCE API calls.
 // Listing actually only returns the current contents of that cache.
 type forwardingRulesLister struct {
+	ctx     context.Context
 	project string
 	c       *configpb.ForwardingRules
 	l       *logger.Logger
@@ -124,7 +126,7 @@ func (frl *forwardingRulesLister) expandForRegion(region string) ([]string, map[
 		cache = make(map[string]*frData)
 	)
 
-	frList, err := frl.computeSvc.ForwardingRules.List(frl.project, region).Do()
+	frList, err := frl.computeSvc.ForwardingRules.List(frl.project, region).Context(lifecycle.Context(frl.ctx)).Do()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -144,7 +146,7 @@ func (frl *forwardingRulesLister) expandForRegion(region string) ([]string, map[
 func (frl *forwardingRulesLister) expand(reEvalInterval time.Duration) {
 	frl.l.Debugf("forwarding_rules.expand: running for the project: %s", frl.project)
 
-	regionList, err := frl.computeSvc.Regions.List(frl.project).Filter(frl.c.GetRegionFilter()).Do()
+	regionList, err := frl.computeSvc.Regions.List(frl.project).Filter(frl.c.GetRegionFilter()).Context(lifecycle.Context(frl.ctx)).Do()
 	if err != nil {
 		frl.l.Errorf("forwarding_rules.expand: error while getting list of all regions: %v", err)
 		return
@@ -173,7 +175,9 @@ func (frl *forwardingRulesLister) expand(reEvalInterval time.Duration) {
 		frl.mu.Unlock()
 
 		numItems += len(names)
-		time.Sleep(sleepBetweenRegions)
+		if !lifecycle.Wait(frl.ctx, sleepBetweenRegions) {
+			return
+		}
 	}
 
 	frl.l.Infof("forwarding_rules.expand: got %d forwarding rules", numItems)
@@ -181,11 +185,13 @@ func (frl *forwardingRulesLister) expand(reEvalInterval time.Duration) {
 
 // defaultComputeService returns a compute.Service object, initialized using
 // default credentials.
-func defaultComputeService(apiVersion string, baseAPIPath string) (*compute.Service, error) {
-	client, err := google.DefaultClient(context.Background(), compute.ComputeScope)
+func defaultComputeService(apiVersion string, baseAPIPath string, contexts ...context.Context) (*compute.Service, error) {
+	ctx := lifecycle.Context(contexts...)
+	client, err := google.DefaultClient(ctx, compute.ComputeScope)
 	if err != nil {
 		return nil, err
 	}
+	context.AfterFunc(ctx, client.CloseIdleConnections)
 	cs, err := compute.New(client)
 	if err != nil {
 		return nil, err
@@ -195,13 +201,18 @@ func defaultComputeService(apiVersion string, baseAPIPath string) (*compute.Serv
 	return cs, nil
 }
 
-func newForwardingRulesLister(project, apiVersion string, baseAPIPath string, c *configpb.ForwardingRules, l *logger.Logger) (*forwardingRulesLister, error) {
-	cs, err := defaultComputeService(apiVersion, baseAPIPath)
+func newForwardingRulesLister(project, apiVersion string, baseAPIPath string, c *configpb.ForwardingRules, l *logger.Logger, contexts ...context.Context) (*forwardingRulesLister, error) {
+	ctx := lifecycle.Context(contexts...)
+	if c.GetReEvalSec() <= 0 {
+		return nil, fmt.Errorf("forwarding_rules: re_eval_sec must be positive")
+	}
+	cs, err := defaultComputeService(apiVersion, baseAPIPath, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("forwarding_rules.expand: error creating compute service: %v", err)
 	}
 
 	frl := &forwardingRulesLister{
+		ctx:           ctx,
 		project:       project,
 		c:             c,
 		cachePerScope: make(map[string]map[string]*frData),
@@ -211,20 +222,7 @@ func newForwardingRulesLister(project, apiVersion string, baseAPIPath string, c 
 	}
 
 	reEvalInterval := time.Duration(c.GetReEvalSec()) * time.Second
-	go func() {
-		frl.expand(0)
-		// Introduce a random delay between 0-reEvalInterval before
-		// starting the refresh loop. If there are multiple cloudprober
-		// forwardingRules, this will make sure that each instance calls GCE
-		// API at a different point of time.
-		rand.Seed(time.Now().UnixNano())
-		randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-		time.Sleep(time.Duration(randomDelaySec) * time.Second)
-		ticker := time.NewTicker(reEvalInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			frl.expand(reEvalInterval)
-		}
-	}()
+	go lifecycle.Run(ctx, reEvalInterval, func() { frl.expand(0) }, func() { frl.expand(reEvalInterval) })
+
 	return frl, nil
 }

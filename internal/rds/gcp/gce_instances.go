@@ -29,6 +29,7 @@ import (
 	"cloud.google.com/go/compute/metadata"
 	md "github.com/cloudprober/cloudprober/common/metadata"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/gcp/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -94,6 +95,7 @@ var GCEInstancesFilters = struct {
 // that's populated at a regular interval by making the GCE API calls.
 // Listing actually only returns the current contents of that cache.
 type gceInstancesLister struct {
+	ctx          context.Context
 	project      string
 	c            *configpb.GCEInstances
 	thisInstance string
@@ -273,7 +275,15 @@ func parseInstancesJSON(resp []byte) (keys []string, instances map[string]*insta
 }
 
 func getURLWithClient(client *http.Client, url string) ([]byte, error) {
-	resp, err := client.Get(url)
+	return getURLWithContext(context.Background(), client, url)
+}
+
+func getURLWithContext(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +377,9 @@ func (il *gceInstancesLister) expand(reEvalInterval time.Duration) {
 		il.mu.Unlock()
 
 		numItems += len(names)
-		time.Sleep(sleepBetweenZones)
+		if !lifecycle.Wait(il.ctx, sleepBetweenZones) {
+			return
+		}
 	}
 
 	// Check if we've a case of deleted zone and we need to clear cache.
@@ -386,7 +398,11 @@ func (il *gceInstancesLister) expand(reEvalInterval time.Duration) {
 	il.l.Infof("gce_instances.expand: got %d instances", numItems)
 }
 
-func newGCEInstancesLister(project, apiVersion string, baseAPIPath string, c *configpb.GCEInstances, l *logger.Logger) (*gceInstancesLister, error) {
+func newGCEInstancesLister(project, apiVersion string, baseAPIPath string, c *configpb.GCEInstances, l *logger.Logger, contexts ...context.Context) (*gceInstancesLister, error) {
+	ctx := lifecycle.Context(contexts...)
+	if c.GetReEvalSec() <= 0 {
+		return nil, fmt.Errorf("gce_instances: re_eval_sec must be positive")
+	}
 	var thisInstance string
 	if metadata.OnGCE() && !md.IsKubernetes() {
 		var err error
@@ -397,38 +413,27 @@ func newGCEInstancesLister(project, apiVersion string, baseAPIPath string, c *co
 		l.Infof("newGCEInstancesLister: this instance: %s", thisInstance)
 	}
 
-	client, err := google.DefaultClient(context.Background(), computeScope)
+	client, err := google.DefaultClient(ctx, computeScope)
 	if err != nil {
 		return nil, fmt.Errorf("error creating default HTTP OAuth client: %v", err)
 	}
 
 	il := &gceInstancesLister{
+		ctx:           ctx,
 		project:       project,
 		c:             c,
 		thisInstance:  thisInstance,
 		baseAPIPath:   baseAPIPath + apiVersion + "/projects/" + project,
 		httpClient:    client,
-		getURLFunc:    getURLWithClient,
+		getURLFunc:    func(client *http.Client, url string) ([]byte, error) { return getURLWithContext(ctx, client, url) },
 		cachePerScope: make(map[string]map[string]*instanceData),
 		namesPerScope: make(map[string][]string),
 		l:             l,
 	}
 
 	reEvalInterval := time.Duration(c.GetReEvalSec()) * time.Second
-	go func() {
-		il.expand(0)
-		// Introduce a random delay between 0-reEvalInterval before
-		// starting the refresh loop. If there are multiple cloudprober
-		// gceInstances, this will make sure that each instance calls GCE
-		// API at a different point of time.
-		rand.Seed(time.Now().UnixNano())
-		randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-		time.Sleep(time.Duration(randomDelaySec) * time.Second)
-		ticker := time.NewTicker(reEvalInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			il.expand(reEvalInterval)
-		}
-	}()
+	context.AfterFunc(ctx, client.CloseIdleConnections)
+	go lifecycle.Run(ctx, reEvalInterval, func() { il.expand(0) }, func() { il.expand(reEvalInterval) })
+
 	return il, nil
 }

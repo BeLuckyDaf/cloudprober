@@ -66,6 +66,9 @@ type Probe struct {
 	c    *configpb.ProbeConf
 	l    *logger.Logger
 
+	transportsMu  sync.Mutex
+	transports    map[*http.Transport]struct{}
+	closing       bool
 	baseTransport http.RoundTripper
 	redirectFunc  func(req *http.Request, via []*http.Request) error
 
@@ -557,6 +560,12 @@ func (result *probeResult) Metrics(ts time.Time, runID int64, opts *options.Opti
 }
 
 func (p *Probe) httpClient(target endpoint.Endpoint) *http.Client {
+	client, _ := p.newHTTPClient(target)
+	return client
+}
+
+func (p *Probe) newHTTPClient(target endpoint.Endpoint) (*http.Client, *http.Transport) {
+	var ownedTransport *http.Transport
 	// We check for http.Transport because tests use a custom
 	// RoundTripper implementation.
 	var transport http.RoundTripper = p.baseTransport
@@ -574,6 +583,16 @@ func (p *Probe) httpClient(target endpoint.Endpoint) *http.Client {
 				t.TLSClientConfig.ServerName = hostForTarget(target)
 			}
 		}
+		p.transportsMu.Lock()
+		if p.closing {
+			t.DisableKeepAlives = true
+		}
+		if p.transports == nil {
+			p.transports = make(map[*http.Transport]struct{})
+		}
+		p.transports[t] = struct{}{}
+		ownedTransport = t
+		p.transportsMu.Unlock()
 		transport = t
 	}
 
@@ -615,7 +634,7 @@ func (p *Probe) httpClient(target endpoint.Endpoint) *http.Client {
 		transport = otelhttp.NewTransport(transport, opts...)
 	}
 
-	return &http.Client{Transport: transport, CheckRedirect: p.redirectFunc}
+	return &http.Client{Transport: transport, CheckRedirect: p.redirectFunc}, ownedTransport
 }
 
 // Returns clients for a target. We use a different HTTP client (transport) for
@@ -626,17 +645,43 @@ func (p *Probe) httpClient(target endpoint.Endpoint) *http.Client {
 // connection setup in the probing path). This behavior is desirable if you
 // want to hit as many backends as possible, behind a single VIP.
 func (p *Probe) clientsForTarget(target endpoint.Endpoint) []*http.Client {
-	clients := make([]*http.Client, p.c.GetRequestsPerProbe())
-	for i := range clients {
-		clients[i] = p.httpClient(target)
+	return p.newTargetState(target).clients
+}
+
+func (p *Probe) newTargetState(target endpoint.Endpoint) *targetState {
+	state := &targetState{owner: p, clients: make([]*http.Client, p.c.GetRequestsPerProbe())}
+	for i := range state.clients {
+		client, transport := p.newHTTPClient(target)
+		state.clients[i] = client
+		if transport != nil {
+			state.transports = append(state.transports, transport)
+		}
 	}
-	return clients
+	return state
 }
 
 type targetState struct {
-	req     *http.Request
-	clients []*http.Client
-	runCnt  int64
+	req        *http.Request
+	clients    []*http.Client
+	runCnt     int64
+	owner      *Probe
+	transports []*http.Transport
+}
+
+// Close runs after all work for this target has finished. Deregister its
+// transports so changes in discovered targets do not retain old clients.
+func (s *targetState) Close() error {
+	if s.owner == nil {
+		return nil
+	}
+	s.owner.transportsMu.Lock()
+	defer s.owner.transportsMu.Unlock()
+	for _, transport := range s.transports {
+		transport.CloseIdleConnections()
+		delete(s.owner.transports, transport)
+	}
+	s.transports = nil
+	return nil
 }
 
 func (p *Probe) runProbe(ctx context.Context, runReq *sched.RunProbeForTargetRequest) {
@@ -646,15 +691,12 @@ func (p *Probe) runProbe(ctx context.Context, runReq *sched.RunProbeForTargetReq
 
 	// We cache the HTTP requests, clients, and runCnt in the target state.
 	if runReq.TargetState == nil {
-		runReq.TargetState = &targetState{}
+		runReq.TargetState = p.newTargetState(runReq.Target)
 	}
 
 	target, result, tgtState := runReq.Target, runReq.Result.(*probeResult), runReq.TargetState.(*targetState)
 
 	tgtState.runCnt++
-	if tgtState.clients == nil {
-		tgtState.clients = p.clientsForTarget(runReq.Target)
-	}
 
 	// Update request if it is nil, or if we are resolving first and we are at
 	// the stats export interval. This is to make sure that we are using the
@@ -692,7 +734,9 @@ func (p *Probe) runProbe(ctx context.Context, runReq *sched.RunProbeForTargetReq
 		go func(req *http.Request, numReq int, target endpoint.Endpoint, result *probeResult) {
 			defer wg.Done()
 
-			time.Sleep(time.Duration(numReq*int(p.c.GetRequestsIntervalMsec())) * time.Millisecond)
+			if !sched.WaitContext(ctx, time.Duration(numReq*int(p.c.GetRequestsIntervalMsec()))*time.Millisecond) {
+				return
+			}
 			// Ignore the error returned by doHTTPRequest, as it's already logged.
 			_ = p.doHTTPRequest(p.prepareRequest(ctx, req), tgtState.clients[numReq], target, result, &resultMu)
 		}(tgtState.req, numReq, target, result)
@@ -717,6 +761,7 @@ func (p *Probe) RunOnce(ctx context.Context) []*singlerun.ProbeRunResult {
 
 // Start starts and runs the probe indefinitely.
 func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) {
+	defer p.Close()
 	s := &sched.Scheduler{
 		ProbeName:         p.name,
 		DataChan:          dataChan,
@@ -725,4 +770,19 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 	}
 
 	s.UpdateTargetsAndStartProbes(ctx)
+}
+
+// Close releases resources acquired during initialization and unblocks active I/O.
+func (p *Probe) Close() error {
+	p.transportsMu.Lock()
+	defer p.transportsMu.Unlock()
+	p.closing = true
+	for transport := range p.transports {
+		transport.CloseIdleConnections()
+		delete(p.transports, transport)
+	}
+	if closer, ok := p.baseTransport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+	return nil
 }

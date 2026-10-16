@@ -72,6 +72,15 @@ func (pr *Prober) saveProbesConfigToFile(filePath string) error {
 
 // AddProbe adds the given probe to cloudprober.
 func (pr *Prober) AddProbe(ctx context.Context, req *pb.AddProbeRequest) (*pb.AddProbeResponse, error) {
+	pr.operations.Lock()
+	defer pr.operations.Unlock()
+	pr.mu.RLock()
+	ready := !pr.stopped && pr.startCtx != nil && pr.startCtx.Err() == nil
+	pr.mu.RUnlock()
+	if !ready {
+		return nil, status.Error(codes.FailedPrecondition, "prober not running")
+	}
+
 	pr.l.Info("AddProbe called")
 
 	p := req.GetProbeConfig()
@@ -85,9 +94,6 @@ func (pr *Prober) AddProbe(ctx context.Context, req *pb.AddProbeRequest) (*pb.Ad
 	pr.warnLatencyTypeClash(p.GetName())
 
 	// Start probe using the prober's start context.
-	if pr.startCtx == nil {
-		return &pb.AddProbeResponse{}, status.Errorf(codes.FailedPrecondition, "prober not started")
-	}
 	pr.startProbe(p.GetName())
 
 	if *probesConfigSavePath != "" {
@@ -114,18 +120,27 @@ func (pr *Prober) removeProbe(name string) error {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	if pr.Probes[name] == nil {
-		return fmt.Errorf("probe %s not found", name)
+	if pr.stopped {
+		return status.Error(codes.FailedPrecondition, "prober stopped")
 	}
-
-	pr.probeCancelFunc[name]()
+	p := pr.Probes[name]
+	if p == nil {
+		return status.Errorf(codes.NotFound, "probe %s not found", name)
+	}
+	if cancel := pr.probeCancelFunc[name]; cancel != nil {
+		cancel()
+	}
+	delete(pr.probeCancelFunc, name)
 	delete(pr.Probes, name)
+	closeProbe(p)
 	return nil
 }
 
 // RemoveProbe gRPC method cancels the given probe and removes its from the
 // prober's internal database.
 func (pr *Prober) RemoveProbe(ctx context.Context, req *pb.RemoveProbeRequest) (*pb.RemoveProbeResponse, error) {
+	pr.operations.Lock()
+	defer pr.operations.Unlock()
 	pr.l.Infof("RemoveProbe called with: %s", req.GetProbeName())
 
 	name := req.GetProbeName()
@@ -134,7 +149,7 @@ func (pr *Prober) RemoveProbe(ctx context.Context, req *pb.RemoveProbeRequest) (
 	}
 
 	if err := pr.removeProbe(name); err != nil {
-		return &pb.RemoveProbeResponse{}, status.Errorf(codes.NotFound, "%v", err)
+		return &pb.RemoveProbeResponse{}, err
 	}
 
 	if *probesConfigSavePath != "" {
@@ -146,6 +161,17 @@ func (pr *Prober) RemoveProbe(ctx context.Context, req *pb.RemoveProbeRequest) (
 
 // GetProbeStatus returns the ongoing probe status data.
 func (pr *Prober) GetProbeStatus(ctx context.Context, req *pb.GetProbeStatusRequest) (*pb.GetProbeStatusResponse, error) {
+	if err := pr.checkRunning(); err != nil {
+		return nil, err
+	}
+	// A retiring surfacer no longer services requests. Cancel in-flight queries
+	// with its runtime so the old gRPC transport can finish draining.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if pr.initCtx != nil {
+		stop := context.AfterFunc(pr.initCtx, cancel)
+		defer stop()
+	}
 	if pr.probeStatusSurfacer == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "probestatus surfacer is not available")
 	}
@@ -205,6 +231,9 @@ func (pr *Prober) GetProbeStatus(ctx context.Context, req *pb.GetProbeStatusRequ
 
 // ListProbes gRPC method returns the list of probes from the in-memory database.
 func (pr *Prober) ListProbes(ctx context.Context, req *pb.ListProbesRequest) (*pb.ListProbesResponse, error) {
+	if err := pr.checkRunning(); err != nil {
+		return nil, err
+	}
 	pr.l.Info("ListProbes called")
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
@@ -222,6 +251,9 @@ func (pr *Prober) ListProbes(ctx context.Context, req *pb.ListProbesRequest) (*p
 }
 
 func (pr *Prober) SaveProbesConfig(ctx context.Context, req *pb.SaveProbesConfigRequest) (*pb.SaveProbesConfigResponse, error) {
+	if err := pr.checkRunning(); err != nil {
+		return nil, err
+	}
 	filePath := req.GetFilePath()
 	if filePath == "" {
 		filePath = *probesConfigSavePath
@@ -237,4 +269,35 @@ func (pr *Prober) SaveProbesConfig(ctx context.Context, req *pb.SaveProbesConfig
 	return &pb.SaveProbesConfigResponse{
 		FilePath: &filePath,
 	}, nil
+}
+
+// checkRunning rejects requests handled by a retired runtime.
+func (pr *Prober) checkRunning() error {
+	pr.mu.RLock()
+	defer pr.mu.RUnlock()
+	if pr.stopped {
+		return status.Error(codes.FailedPrecondition, "prober stopped")
+	}
+	return nil
+}
+
+// ReloadConfig delegates to the owner, which can replace all runtime services.
+// No prober lock is held while calling it: the callback stops this instance.
+func (pr *Prober) ReloadConfig(ctx context.Context, req *pb.ReloadConfigRequest) (*pb.ReloadConfigResponse, error) {
+	pr.mu.RLock()
+	f, stopped := pr.reloadConfig, pr.stopped
+	pr.mu.RUnlock()
+	if stopped {
+		return nil, status.Error(codes.FailedPrecondition, "prober stopped")
+	}
+	if f == nil {
+		return nil, status.Error(codes.FailedPrecondition, "config reload is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if err := f(ctx); err != nil {
+		return nil, err
+	}
+	return &pb.ReloadConfigResponse{}, nil
 }

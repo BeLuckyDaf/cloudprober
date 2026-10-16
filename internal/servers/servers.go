@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 
 	"github.com/cloudprober/cloudprober/internal/servers/external"
@@ -70,6 +71,14 @@ type ServerInfo struct {
 	Conf      string
 }
 
+// Close releases resources owned by this server, if supported.
+func (s *ServerInfo) Close() error {
+	if closer, ok := s.Server.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // Init initializes cloudprober servers, based on the provided config.
 func Init(initCtx context.Context, serverDefs []*configpb.ServerDef) ([]*ServerInfo, error) {
 	var servers []*ServerInfo
@@ -90,8 +99,13 @@ func Init(initCtx context.Context, serverDefs []*configpb.ServerDef) ([]*ServerI
 			server, err = grpc.New(initCtx, serverDef.GetGrpcServer(), l)
 		case configpb.ServerDef_EXTERNAL:
 			server, err = external.New(initCtx, serverDef.GetExternalServer(), l)
+		default:
+			err = fmt.Errorf("unknown server type: %v", serverDef.GetType())
 		}
 		if err != nil {
+			for _, initialized := range servers {
+				initialized.Close()
+			}
 			return nil, fmt.Errorf("error while initializing server %s: %v", serverDef.GetType().String(), err)
 		}
 

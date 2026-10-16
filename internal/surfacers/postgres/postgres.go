@@ -32,6 +32,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -207,6 +208,7 @@ func (s *Surfacer) writeMetrics(ctx context.Context, ems []*metrics.EventMetrics
 
 // init connects to postgres
 func (s *Surfacer) init(ctx context.Context) error {
+	ctx, s.cancel = context.WithCancel(ctx)
 	s.l.Info("Initializing postgres surfacer")
 
 	var err error
@@ -215,6 +217,7 @@ func (s *Surfacer) init(ctx context.Context) error {
 		return err
 	}
 	if err = s.dbconn.Ping(ctx); err != nil {
+		s.dbconn.Close()
 		return err
 	}
 	s.writeChan = make(chan *metrics.EventMetrics, s.c.GetMetricsBufferSize())
@@ -225,7 +228,9 @@ func (s *Surfacer) init(ctx context.Context) error {
 
 	// Start a goroutine to run forever, polling on the writeChan. Allows
 	// for the surfacer to write asynchronously to the serial port.
+	s.done = make(chan struct{})
 	go func() {
+		defer close(s.done)
 		defer s.dbconn.Close()
 
 		metricsBatchSize, batchTimerSec := s.c.GetMetricsBatchSize(), s.c.GetBatchTimerSec()
@@ -239,6 +244,16 @@ func (s *Surfacer) init(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
+				for len(s.writeChan) > 0 {
+					buffer = append(buffer, <-s.writeChan)
+				}
+				if len(buffer) > 0 {
+					flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if err := s.writeMetrics(flushCtx, buffer); err != nil {
+						s.l.Warningf("Error flushing metrics on shutdown: %v", err)
+					}
+					cancel()
+				}
 				s.l.Infof("Context canceled, stopping the surfacer write loop")
 				return
 			case em := <-s.writeChan:
@@ -264,6 +279,17 @@ func (s *Surfacer) init(ctx context.Context) error {
 		}
 	}()
 
+	return nil
+}
+
+// Close stops the exporter and waits for the database pool to close.
+func (s *Surfacer) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.done != nil {
+		<-s.done
+	}
 	return nil
 }
 
@@ -322,11 +348,16 @@ type Surfacer struct {
 
 	openDB func(ctx context.Context, connectionString string) (*pgxpool.Pool, error)
 	dbconn *pgxpool.Pool
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // New initializes a Postgres surfacer. Postgres surfacer inserts probe results
 // into a postgres database.
 func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Options, l *logger.Logger) (*Surfacer, error) {
+	if config.GetBatchTimerSec() <= 0 || config.GetMetricsBatchSize() <= 0 || config.GetMetricsBufferSize() < 0 {
+		return nil, fmt.Errorf("invalid postgres surfacer buffer, batch size, or export interval")
+	}
 	s := &Surfacer{
 		c:    config,
 		opts: opts,

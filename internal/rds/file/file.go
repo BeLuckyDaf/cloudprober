@@ -20,13 +20,13 @@ package file
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cloudprober/cloudprober/internal/file"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/file/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -65,6 +65,7 @@ var SupportedFilters = struct {
 
 // lister implements file-based targets lister.
 type lister struct {
+	ctx       context.Context
 	mu        sync.RWMutex
 	filePath  string
 	format    configpb.ProviderConfig_Format
@@ -160,7 +161,7 @@ func (ls *lister) shouldReloadFile() bool {
 		return true
 	}
 
-	modTime, err := file.ModTime(context.Background(), ls.filePath)
+	modTime, err := file.ModTime(lifecycle.Context(ls.ctx), ls.filePath)
 	if err != nil {
 		ls.l.Warningf("file(%s): Error getting modified time: %v; Ignoring modified time check.", ls.filePath, err)
 		return true
@@ -177,7 +178,7 @@ func (ls *lister) refresh() error {
 		return nil
 	}
 
-	b, err := file.ReadFile(context.Background(), ls.filePath)
+	b, err := file.ReadFile(lifecycle.Context(ls.ctx), ls.filePath)
 	if err != nil {
 		return fmt.Errorf("file(%s): error while reading file: %v", ls.filePath, err)
 	}
@@ -232,7 +233,11 @@ func formatFromPath(path string) configpb.ProviderConfig_Format {
 }
 
 // newLister creates a new file-based targets lister.
-func newLister(filePath string, c *configpb.ProviderConfig, l *logger.Logger) (*lister, error) {
+func newLister(filePath string, c *configpb.ProviderConfig, l *logger.Logger, contexts ...context.Context) (*lister, error) {
+	ctx := lifecycle.Context(contexts...)
+	if c.GetReEvalSec() < 0 {
+		return nil, fmt.Errorf("file: re_eval_sec must not be negative")
+	}
 	format := c.GetFormat()
 	if format == configpb.ProviderConfig_UNSPECIFIED {
 		format = formatFromPath(filePath)
@@ -240,6 +245,7 @@ func newLister(filePath string, c *configpb.ProviderConfig, l *logger.Logger) (*
 	}
 
 	ls := &lister{
+		ctx:          ctx,
 		filePath:     filePath,
 		format:       format,
 		l:            l,
@@ -252,25 +258,12 @@ func newLister(filePath string, c *configpb.ProviderConfig, l *logger.Logger) (*
 	}
 
 	reEvalInterval := time.Duration(reEvalSec) * time.Second
-	go func() {
-		if err := ls.refresh(); err != nil {
+	refresh := func() {
+		if err := ls.refresh(); err != nil && ctx.Err() == nil {
 			l.Error(err.Error())
 		}
-		// Introduce a random delay between 0-reEvalInterval before
-		// starting the refresh loop. If there are multiple cloudprober
-		// instances, this will make sure that each instance refreshes
-		// at a different point of time.
-		rand.Seed(time.Now().UnixNano())
-		randomDelaySec := rand.Intn(int(reEvalInterval.Seconds()))
-		time.Sleep(time.Duration(randomDelaySec) * time.Second)
-		ticker := time.NewTicker(reEvalInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			if err := ls.refresh(); err != nil {
-				l.Error(err.Error())
-			}
-		}
-	}()
+	}
+	go lifecycle.Run(ctx, reEvalInterval, refresh, refresh)
 
 	return ls, nil
 }
@@ -351,6 +344,11 @@ type Provider struct {
 // New creates a File (file) provider for RDS server, based on the
 // provided config.
 func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
+	return NewWithContext(context.Background(), c, l)
+}
+
+// NewWithContext creates a provider whose refresh workers stop with ctx.
+func NewWithContext(ctx context.Context, c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 	filePaths := c.GetFilePath()
 	p := &Provider{
 		filePaths: filePaths,
@@ -358,7 +356,7 @@ func New(c *configpb.ProviderConfig, l *logger.Logger) (*Provider, error) {
 	}
 
 	for _, filePath := range filePaths {
-		lister, err := newLister(filePath, c, l)
+		lister, err := newLister(filePath, c, l, ctx)
 		if err != nil {
 			return nil, err
 		}

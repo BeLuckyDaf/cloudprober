@@ -250,7 +250,7 @@ func (p *Probe) processMessage(buf []byte, rxTS time.Time, srcAddr *net.UDPAddr)
 }
 
 // outputResults writes results to the output channel.
-func (p *Probe) outputResults(expectedCt int64, stats chan<- *probeRunResult) {
+func (p *Probe) outputResults(ctx context.Context, expectedCt int64, stats chan<- *probeRunResult) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, r := range p.res {
@@ -258,7 +258,11 @@ func (p *Probe) outputResults(expectedCt int64, stats chan<- *probeRunResult) {
 		if delta > 0 {
 			r.total.IncBy(delta)
 		}
-		stats <- r
+		select {
+		case stats <- r:
+		case <-ctx.Done():
+			return
+		}
 	}
 	p.initProbeRunResults()
 }
@@ -288,7 +292,7 @@ func (p *Probe) outputLoop(ctx context.Context, stats chan<- *probeRunResult) {
 			// sending intervals in the period times the number of sending ports.
 			numIntervals := int64((time.Since(lastExport) + roundAdd) / p.opts.Interval)
 			expectedCt := numIntervals * int64(p.c.GetPacketsPerProbe())
-			p.outputResults(expectedCt, stats)
+			p.outputResults(ctx, expectedCt, stats)
 			p.logErrs()
 			lastExport = time.Now()
 		}
@@ -343,7 +347,11 @@ func (p *Probe) recvLoop(ctx context.Context, echoChan chan<- *echoMsg) {
 				addr: srcAddr,
 			}
 			copy(e.buf, b[:n])
-			echoChan <- e
+			select {
+			case echoChan <- e:
+			case <-ctx.Done():
+				return
+			}
 		}
 		p.processMessage(b[:n], rxTS, srcAddr)
 	}
@@ -432,11 +440,17 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 	}
 	resultsChan := make(chan *probeRunResult, resultsChLen)
 
-	go p.statsKeeper(ctx, "udp", p.name, p.opts, resultsChan, dataChan)
+	var statsWG sync.WaitGroup
+	statsWG.Add(1)
+	go func() { defer statsWG.Done(); p.statsKeeper(ctx, "udp", p.name, p.opts, resultsChan, dataChan) }()
 
 	// probeLoop runs forever and returns only when the probe has to exit.
 	// So, it is safe to cleanup (in the "Start" function) once probeLoop returns.
 	p.probeLoop(ctx, resultsChan)
 	p.cleanup()
+	statsWG.Wait()
 	return
 }
+
+// Close releases resources acquired during initialization and unblocks active I/O.
+func (p *Probe) Close() error { p.cleanup(); return nil }

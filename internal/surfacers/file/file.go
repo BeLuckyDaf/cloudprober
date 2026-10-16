@@ -35,6 +35,14 @@ import (
 	configpb "github.com/cloudprober/cloudprober/internal/surfacers/file/proto"
 )
 
+type appendContextKey struct{}
+
+// WithAppend preserves an existing metrics file when replacing a runtime.
+// Initial startup retains its normal behavior of creating a fresh output file.
+func WithAppend(ctx context.Context) context.Context {
+	return context.WithValue(ctx, appendContextKey{}, true)
+}
+
 // Surfacer structures for writing onto a GCE instance's serial port. Keeps
 // track of an output file which the incoming data is serialized onto (one entry
 // per line).
@@ -64,6 +72,9 @@ type Surfacer struct {
 	suppressedLogCount atomic.Int64
 
 	closeOnce sync.Once
+	writeMu   sync.RWMutex
+	closed    bool
+	closeErr  error
 }
 
 func (s *Surfacer) processInput(ctx context.Context) {
@@ -107,7 +118,11 @@ func (s *Surfacer) init(ctx context.Context, id int64) error {
 	if s.c.GetFilePath() == "" {
 		s.outf = os.Stdout
 	} else {
-		outf, err := os.Create(s.c.GetFilePath())
+		flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+		if appendOutput, _ := ctx.Value(appendContextKey{}).(bool); appendOutput {
+			flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+		}
+		outf, err := os.OpenFile(s.c.GetFilePath(), flags, 0666)
 		if err != nil {
 			return fmt.Errorf("failed to create file for writing: %v", err)
 		}
@@ -125,29 +140,46 @@ func (s *Surfacer) init(ctx context.Context, id int64) error {
 	// Start a goroutine to run forever, polling on the inChan. Allows
 	// for the surfacer to write asynchronously to the serial port.
 	s.processInputWg.Add(1)
-	go s.processInput(ctx)
+	go s.processInput(context.WithoutCancel(ctx))
+	context.AfterFunc(ctx, func() { s.Close() })
 
 	return nil
 }
 
 // close closes the input channel, waits for input processing to finish,
 // and closes the compression buffer if open.
-func (s *Surfacer) close() {
-	s.closeOnce.Do(func() {
-		close(s.inChan)
-		s.processInputWg.Wait()
+func (s *Surfacer) close() { s.Close() }
 
+// Close drains pending metrics, flushes compressed output, and closes the file.
+// Standard output belongs to the process and is never closed by a surfacer.
+func (s *Surfacer) Close() error {
+	s.closeOnce.Do(func() {
+		s.writeMu.Lock()
+		s.closed = true
+		if s.inChan != nil {
+			close(s.inChan)
+		}
+		s.writeMu.Unlock()
+		s.processInputWg.Wait()
 		if s.compressionBuffer != nil {
 			s.compressionBuffer.Close()
 		}
-		s.outf.Close()
+		if s.outf != nil && s.outf != os.Stdout {
+			s.closeErr = s.outf.Close()
+		}
 	})
+	return s.closeErr
 }
 
 // Write queues the incoming data into a channel. This channel is watched by a
 // goroutine that actually writes data to a file ((usually set as a GCE
 // instance's serial port).
 func (s *Surfacer) Write(ctx context.Context, em *metrics.EventMetrics) {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.inChan <- em:
 	default:

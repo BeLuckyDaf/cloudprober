@@ -43,7 +43,7 @@ func key(namespace string, labelSelector []string, resourceType string) string {
 	return strings.Join([]string{namespace, strings.Join(labelSelector, ","), resourceType}, "+")
 }
 
-func initRDSServer(k string, kpc *k8sconfigpb.ProviderConfig, l *logger.Logger) (*server.Server, error) {
+func initRDSServer(ctx context.Context, k string, kpc *k8sconfigpb.ProviderConfig, l *logger.Logger) (*server.Server, error) {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 
@@ -60,7 +60,7 @@ func initRDSServer(k string, kpc *k8sconfigpb.ProviderConfig, l *logger.Logger) 
 		Config: &serverconfigpb.Provider_KubernetesConfig{KubernetesConfig: kpc},
 	}
 
-	srv, err := server.New(context.Background(), &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{kc}}, nil, l)
+	srv, err := server.New(ctx, &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{kc}}, nil, l)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +122,10 @@ func rdsRequest(resources, nameF, portFilter string) *rdspb.ListResourcesRequest
 }
 
 func k8sTargets(pb *targetspb.K8STargets, l *logger.Logger) (*rdsclient.Client, error) {
+	return k8sTargetsWithContext(context.Background(), pb, l)
+}
+
+func k8sTargetsWithContext(ctx context.Context, pb *targetspb.K8STargets, l *logger.Logger) (*rdsclient.Client, error) {
 	pc, resources, nameF := parseConfig(pb)
 	if resources == "" {
 		return nil, fmt.Errorf("targets.k8s: no kubernetes resources configured")
@@ -135,12 +139,21 @@ func k8sTargets(pb *targetspb.K8STargets, l *logger.Logger) (*rdsclient.Client, 
 
 	if pb.GetRdsServerOptions() != nil {
 		conf.ServerOptions = pb.GetRdsServerOptions()
-		return rdsclient.New(conf, nil, l)
+		return rdsclient.NewWithContext(ctx, conf, nil, l)
 	}
 
-	s, err := initRDSServer(key(pb.GetNamespace(), pb.GetLabelSelector(), resources), pc, l)
+	s, err := initRDSServer(ctx, key(pb.GetNamespace(), pb.GetLabelSelector(), resources), pc, l)
 	if err != nil {
 		return nil, fmt.Errorf("k8s: error creating resource discovery server: %v", err)
 	}
-	return rdsclient.New(conf, s.ListResources, l)
+	return rdsclient.NewWithContext(ctx, conf, s.ListResources, l)
+}
+
+func resetK8S() {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	for _, srv := range global.servers {
+		srv.Close()
+	}
+	global.servers = nil
 }

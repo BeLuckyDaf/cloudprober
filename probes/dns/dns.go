@@ -325,7 +325,9 @@ func (p *Probe) runProbe(ctx context.Context, runReq *sched.RunProbeForTargetReq
 		var eg errgroup.Group
 		for i := 0; i < int(p.c.GetRequestsPerProbe()); i++ {
 			eg.Go(func() error {
-				time.Sleep(time.Duration(i*int(p.c.GetRequestsIntervalMsec())) * time.Millisecond)
+				if !sched.WaitContext(ctx, time.Duration(i*int(p.c.GetRequestsIntervalMsec()))*time.Millisecond) {
+					return ctx.Err()
+				}
 				return p.doDNSRequest(ctx, fullTarget, result, &resultMu)
 			})
 		}

@@ -17,11 +17,11 @@ package kubernetes
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	pb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server/filter"
 	"github.com/cloudprober/cloudprober/logger"
@@ -195,19 +195,5 @@ func (rl *resourceLister[T]) expand() {
 
 // start does the initial expansion and then refreshes in the background.
 func (rl *resourceLister[T]) start(reEvalInterval time.Duration) {
-	go func() {
-		rl.expand()
-
-		// Introduce a random delay between 0-reEvalInterval before starting
-		// the refresh loop. If there are multiple cloudprober instances, this
-		// makes sure that each one calls the API server at a different point
-		// of time.
-		time.Sleep(time.Duration(rand.Int63n(int64(reEvalInterval))))
-
-		ticker := time.NewTicker(reEvalInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			rl.expand()
-		}
-	}()
+	go lifecycle.Run(rl.kClient.ctx, reEvalInterval, rl.expand, rl.expand)
 }

@@ -68,6 +68,7 @@ import (
 	"github.com/cloudprober/cloudprober/internal/rds/client"
 	clientconfigpb "github.com/cloudprober/cloudprober/internal/rds/client/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/gcp"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	rdspb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	"github.com/cloudprober/cloudprober/internal/rds/server"
 	serverconfigpb "github.com/cloudprober/cloudprober/internal/rds/server/proto"
@@ -91,6 +92,7 @@ type Targets interface {
 // gceResources encapsulates a set of GCE resources of a particular type. It's
 // mostly a wrapper around RDS clients created during the initialization step.
 type gceResources struct {
+	ctx        context.Context
 	c          *configpb.TargetsConf
 	globalOpts *configpb.GlobalOptions
 	l          *logger.Logger
@@ -106,7 +108,7 @@ type gceResources struct {
 	useDNS bool
 }
 
-func initRDSServer(resourceType, apiVersion string, projects []string, reEvalInterval int, l *logger.Logger) (*server.Server, error) {
+func initRDSServer(ctx context.Context, resourceType, apiVersion string, projects []string, reEvalInterval int, l *logger.Logger) (*server.Server, error) {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 
@@ -119,7 +121,7 @@ func initRDSServer(resourceType, apiVersion string, projects []string, reEvalInt
 	}
 
 	pc := gcp.DefaultProviderConfig(projects, map[string]string{gcp.ResourceTypes.GCEInstances: ""}, reEvalInterval, apiVersion)
-	srv, err := server.New(context.Background(), &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{pc}}, nil, l)
+	srv, err := server.New(ctx, &serverconfigpb.ServerConf{Provider: []*serverconfigpb.Provider{pc}}, nil, l)
 	if err != nil {
 		return nil, err
 	}
@@ -128,13 +130,14 @@ func initRDSServer(resourceType, apiVersion string, projects []string, reEvalInt
 	return srv, nil
 }
 
-func newRDSClient(req *rdspb.ListResourcesRequest, listResourcesFunc client.ListResourcesFunc, l *logger.Logger) (*client.Client, error) {
+func newRDSClient(req *rdspb.ListResourcesRequest, listResourcesFunc client.ListResourcesFunc, l *logger.Logger, contexts ...context.Context) (*client.Client, error) {
+	ctx := lifecycle.Context(contexts...)
 	c := &clientconfigpb.ClientConf{
 		Request:   req,
 		ReEvalSec: proto.Int32(10), // Refresh client every 10s.
 	}
 
-	client, err := client.New(c, listResourcesFunc, l)
+	client, err := client.NewWithContext(ctx, c, listResourcesFunc, l)
 	if err != nil {
 		return nil, err
 	}
@@ -152,13 +155,13 @@ func (gr *gceResources) rdsRequest(project string) *rdspb.ListResourcesRequest {
 }
 
 func (gr *gceResources) initClients(projects []string) error {
-	srv, err := initRDSServer(gr.resourceType, gr.globalOpts.GetApiVersion(), projects, int(gr.globalOpts.GetReEvalSec()), gr.l)
+	srv, err := initRDSServer(gr.ctx, gr.resourceType, gr.globalOpts.GetApiVersion(), projects, int(gr.globalOpts.GetReEvalSec()), gr.l)
 	if err != nil {
 		return err
 	}
 
 	for _, project := range projects {
-		client, err := newRDSClient(gr.rdsRequest(project), srv.ListResources, gr.l)
+		client, err := newRDSClient(gr.rdsRequest(project), srv.ListResources, gr.l, gr.ctx)
 		if err != nil {
 			return err
 		}
@@ -199,6 +202,11 @@ func (gr *gceResources) Resolve(name string, ipVer int) (net.IP, error) {
 
 // New is a helper function to unpack a Targets proto into a Targets interface.
 func New(conf *configpb.TargetsConf, globalOpts *configpb.GlobalOptions, res dnsRes.Resolver, l *logger.Logger) (Targets, error) {
+	return NewWithContext(context.Background(), conf, globalOpts, res, l)
+}
+
+// NewWithContext creates GCE targets whose refresh workers stop with ctx.
+func NewWithContext(ctx context.Context, conf *configpb.TargetsConf, globalOpts *configpb.GlobalOptions, res dnsRes.Resolver, l *logger.Logger) (Targets, error) {
 	projects := conf.GetProject()
 	if projects == nil {
 		if !metadata.OnGCE() {
@@ -212,6 +220,7 @@ func New(conf *configpb.TargetsConf, globalOpts *configpb.GlobalOptions, res dns
 	}
 
 	gr := &gceResources{
+		ctx:        ctx,
 		c:          conf,
 		ipConfig:   instancesIPConfig(conf.GetInstances()),
 		clients:    make(map[string]*client.Client),
@@ -238,7 +247,7 @@ func New(conf *configpb.TargetsConf, globalOpts *configpb.GlobalOptions, res dns
 
 	case *configpb.TargetsConf_ForwardingRules:
 		// TODO(manugarg): implement forwarding rules using gceResources like instances.go.
-		frp, err := newForwardingRules(projects[0], globalOpts, conf.GetForwardingRules(), l)
+		frp, err := newForwardingRules(projects[0], globalOpts, conf.GetForwardingRules(), l, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -246,4 +255,20 @@ func New(conf *configpb.TargetsConf, globalOpts *configpb.GlobalOptions, res dns
 	}
 
 	return nil, errors.New("unknown GCE targets type")
+}
+
+// ResetRuntime clears provider caches after the previous runtime is stopped.
+func ResetRuntime() {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	for _, srv := range global.servers {
+		srv.Close()
+	}
+	global.servers = nil
+	forwardingRulesMu.Lock()
+	defer forwardingRulesMu.Unlock()
+	if globalForwardingRules != nil && globalForwardingRules.cancel != nil {
+		globalForwardingRules.cancel()
+	}
+	globalForwardingRules = nil
 }

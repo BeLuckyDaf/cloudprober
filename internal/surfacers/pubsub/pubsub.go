@@ -66,6 +66,7 @@ type Surfacer struct {
 	inChan            chan *metrics.EventMetrics
 	publishResultChan chan *pubsub.PublishResult
 
+	client     *pubsub.Client
 	topic      *pubsub.Topic
 	topicName  string
 	gcpProject string
@@ -74,6 +75,10 @@ type Surfacer struct {
 	starttime         string
 	compressionBuffer *compress.CompressionBuffer
 	processInputWg    sync.WaitGroup
+	closeOnce         sync.Once
+	writeMu           sync.RWMutex
+	closed            bool
+	closeErr          error
 }
 
 func (s *Surfacer) publishMessage(globalCtx context.Context, data []byte) {
@@ -91,7 +96,11 @@ func (s *Surfacer) publishMessage(globalCtx context.Context, data []byte) {
 
 	publishCtx, cancel := context.WithTimeout(globalCtx, publishTimeout)
 	defer cancel()
-	s.publishResultChan <- s.topic.Publish(publishCtx, msg)
+	result := s.topic.Publish(publishCtx, msg)
+	select {
+	case s.publishResultChan <- result:
+	case <-globalCtx.Done():
+	}
 }
 
 func (s *Surfacer) processInput(ctx context.Context) {
@@ -144,15 +153,18 @@ func (s *Surfacer) init(ctx context.Context) error {
 		return fmt.Errorf("pubsub_surfacer: error creating pubsub client: %v", err)
 	}
 
+	s.client = client
 	s.topic = client.Topic(s.topicName)
 	exists, err := s.topic.Exists(ctx)
 	if err != nil {
+		client.Close()
 		return fmt.Errorf("pubsub_surfacer: error determining if topic (%s) exists: %v", s.topicName, err)
 	}
 
 	if !exists {
 		topic, err := client.CreateTopic(ctx, s.topicName)
 		if err != nil {
+			client.Close()
 			return fmt.Errorf("pubsub_surfacer: error creating topic (%s) for publishing: %v", s.topicName, err)
 		}
 		s.topic = topic
@@ -162,7 +174,6 @@ func (s *Surfacer) init(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				s.topic.Stop()
 				return
 			case res, ok := <-s.publishResultChan:
 				if !ok {
@@ -186,26 +197,49 @@ func (s *Surfacer) init(ctx context.Context) error {
 	// for the surfacer to write asynchronously to the serial port.
 	s.processInputWg.Add(1)
 	go s.processInput(ctx)
+	context.AfterFunc(ctx, func() { s.Close() })
 
 	return nil
 }
 
 // close closes the input channel, waits for input processing to finish,
 // and closes the compression buffer if open.
-func (s *Surfacer) close() {
-	close(s.inChan)
-	s.processInputWg.Wait()
+func (s *Surfacer) close() { s.Close() }
 
-	if s.compressionBuffer != nil {
-		s.compressionBuffer.Close()
-	}
-	close(s.publishResultChan)
-	s.topic.Stop()
+// Close stops publishing and releases the topic and client connection.
+func (s *Surfacer) Close() error {
+	s.closeOnce.Do(func() {
+		s.writeMu.Lock()
+		s.closed = true
+		if s.inChan != nil {
+			close(s.inChan)
+		}
+		s.writeMu.Unlock()
+		s.processInputWg.Wait()
+		if s.compressionBuffer != nil {
+			s.compressionBuffer.Close()
+		}
+		if s.publishResultChan != nil {
+			close(s.publishResultChan)
+		}
+		if s.topic != nil {
+			s.topic.Stop()
+		}
+		if s.client != nil {
+			s.closeErr = s.client.Close()
+		}
+	})
+	return s.closeErr
 }
 
 // Write queues the incoming data into a channel. This channel is watched by a
 // goroutine that actually publishes it to a pubsub topic.
 func (s *Surfacer) Write(ctx context.Context, em *metrics.EventMetrics) {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.inChan <- em:
 	default:

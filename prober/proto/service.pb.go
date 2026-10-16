@@ -657,6 +657,78 @@ func (x *SaveProbesConfigResponse) GetFilePath() string {
 	return ""
 }
 
+type ReloadConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReloadConfigRequest) Reset() {
+	*x = ReloadConfigRequest{}
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReloadConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReloadConfigRequest) ProtoMessage() {}
+
+func (x *ReloadConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReloadConfigRequest.ProtoReflect.Descriptor instead.
+func (*ReloadConfigRequest) Descriptor() ([]byte, []int) {
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{14}
+}
+
+type ReloadConfigResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReloadConfigResponse) Reset() {
+	*x = ReloadConfigResponse{}
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReloadConfigResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReloadConfigResponse) ProtoMessage() {}
+
+func (x *ReloadConfigResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReloadConfigResponse.ProtoReflect.Descriptor instead.
+func (*ReloadConfigResponse) Descriptor() ([]byte, []int) {
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{15}
+}
+
 type GetProbeStatusRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// If empty, status for all probes is returned.
@@ -682,7 +754,7 @@ const (
 
 func (x *GetProbeStatusRequest) Reset() {
 	*x = GetProbeStatusRequest{}
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[14]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -694,7 +766,7 @@ func (x *GetProbeStatusRequest) String() string {
 func (*GetProbeStatusRequest) ProtoMessage() {}
 
 func (x *GetProbeStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[14]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -707,7 +779,7 @@ func (x *GetProbeStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProbeStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetProbeStatusRequest) Descriptor() ([]byte, []int) {
-	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{14}
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetProbeStatusRequest) GetProbeName() []string {
@@ -754,7 +826,7 @@ type GetProbeStatusResponse struct {
 
 func (x *GetProbeStatusResponse) Reset() {
 	*x = GetProbeStatusResponse{}
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[15]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -766,7 +838,7 @@ func (x *GetProbeStatusResponse) String() string {
 func (*GetProbeStatusResponse) ProtoMessage() {}
 
 func (x *GetProbeStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[15]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -779,7 +851,7 @@ func (x *GetProbeStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProbeStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetProbeStatusResponse) Descriptor() ([]byte, []int) {
-	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{15}
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetProbeStatusResponse) GetProbeStatus() []*ProbeStatus {
@@ -802,7 +874,7 @@ type LogEntry struct {
 
 func (x *LogEntry) Reset() {
 	*x = LogEntry{}
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[16]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -814,7 +886,7 @@ func (x *LogEntry) String() string {
 func (*LogEntry) ProtoMessage() {}
 
 func (x *LogEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[16]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -827,7 +899,7 @@ func (x *LogEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
 func (*LogEntry) Descriptor() ([]byte, []int) {
-	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{16}
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *LogEntry) GetTimestampSec() int64 {
@@ -876,7 +948,7 @@ type ProbeStatus struct {
 
 func (x *ProbeStatus) Reset() {
 	*x = ProbeStatus{}
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[17]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -888,7 +960,7 @@ func (x *ProbeStatus) String() string {
 func (*ProbeStatus) ProtoMessage() {}
 
 func (x *ProbeStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[17]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -901,7 +973,7 @@ func (x *ProbeStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeStatus.ProtoReflect.Descriptor instead.
 func (*ProbeStatus) Descriptor() ([]byte, []int) {
-	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{17}
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ProbeStatus) GetName() string {
@@ -936,7 +1008,7 @@ type TargetStatus struct {
 
 func (x *TargetStatus) Reset() {
 	*x = TargetStatus{}
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[18]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -948,7 +1020,7 @@ func (x *TargetStatus) String() string {
 func (*TargetStatus) ProtoMessage() {}
 
 func (x *TargetStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[18]
+	mi := &file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -961,7 +1033,7 @@ func (x *TargetStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TargetStatus.ProtoReflect.Descriptor instead.
 func (*TargetStatus) Descriptor() ([]byte, []int) {
-	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{18}
+	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *TargetStatus) GetTargetName() string {
@@ -1024,7 +1096,9 @@ const file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDesc
 	"\x17SaveProbesConfigRequest\x12\x1b\n" +
 	"\tfile_path\x18\x01 \x01(\tR\bfilePath\"7\n" +
 	"\x18SaveProbesConfigResponse\x12\x1b\n" +
-	"\tfile_path\x18\x01 \x01(\tR\bfilePath\"\xd1\x01\n" +
+	"\tfile_path\x18\x01 \x01(\tR\bfilePath\"\x15\n" +
+	"\x13ReloadConfigRequest\"\x16\n" +
+	"\x14ReloadConfigResponse\"\xd1\x01\n" +
 	"\x15GetProbeStatusRequest\x12\x1d\n" +
 	"\n" +
 	"probe_name\x18\x01 \x03(\tR\tprobeName\x122\n" +
@@ -1054,14 +1128,15 @@ const file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDesc
 	"\vtarget_name\x18\x01 \x01(\tR\n" +
 	"targetName\x12\x14\n" +
 	"\x05total\x18\x02 \x01(\x03R\x05total\x12\x18\n" +
-	"\asuccess\x18\x03 \x01(\x03R\asuccess2\x88\x04\n" +
+	"\asuccess\x18\x03 \x01(\x03R\asuccess2\xdf\x04\n" +
 	"\vCloudprober\x12I\n" +
 	"\bAddProbe\x12\x1c.cloudprober.AddProbeRequest\x1a\x1d.cloudprober.AddProbeResponse\"\x00\x12R\n" +
 	"\vRemoveProbe\x12\x1f.cloudprober.RemoveProbeRequest\x1a .cloudprober.RemoveProbeResponse\"\x00\x12I\n" +
 	"\bRunProbe\x12\x1c.cloudprober.RunProbeRequest\x1a\x1d.cloudprober.RunProbeResponse\"\x00\x12O\n" +
 	"\n" +
 	"ListProbes\x12\x1e.cloudprober.ListProbesRequest\x1a\x1f.cloudprober.ListProbesResponse\"\x00\x12a\n" +
-	"\x10SaveProbesConfig\x12$.cloudprober.SaveProbesConfigRequest\x1a%.cloudprober.SaveProbesConfigResponse\"\x00\x12[\n" +
+	"\x10SaveProbesConfig\x12$.cloudprober.SaveProbesConfigRequest\x1a%.cloudprober.SaveProbesConfigResponse\"\x00\x12U\n" +
+	"\fReloadConfig\x12 .cloudprober.ReloadConfigRequest\x1a!.cloudprober.ReloadConfigResponse\"\x00\x12[\n" +
 	"\x0eGetProbeStatus\x12\".cloudprober.GetProbeStatusRequest\x1a#.cloudprober.GetProbeStatusResponse\"\x00B1Z/github.com/cloudprober/cloudprober/prober/proto"
 
 var (
@@ -1076,7 +1151,7 @@ func file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescG
 	return file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDescData
 }
 
-var file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_github_com_cloudprober_cloudprober_prober_proto_service_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_github_com_cloudprober_cloudprober_prober_proto_service_proto_goTypes = []any{
 	(*AddProbeRequest)(nil),          // 0: cloudprober.AddProbeRequest
 	(*AddProbeResponse)(nil),         // 1: cloudprober.AddProbeResponse
@@ -1092,43 +1167,47 @@ var file_github_com_cloudprober_cloudprober_prober_proto_service_proto_goTypes =
 	(*ListProbesResponse)(nil),       // 11: cloudprober.ListProbesResponse
 	(*SaveProbesConfigRequest)(nil),  // 12: cloudprober.SaveProbesConfigRequest
 	(*SaveProbesConfigResponse)(nil), // 13: cloudprober.SaveProbesConfigResponse
-	(*GetProbeStatusRequest)(nil),    // 14: cloudprober.GetProbeStatusRequest
-	(*GetProbeStatusResponse)(nil),   // 15: cloudprober.GetProbeStatusResponse
-	(*LogEntry)(nil),                 // 16: cloudprober.LogEntry
-	(*ProbeStatus)(nil),              // 17: cloudprober.ProbeStatus
-	(*TargetStatus)(nil),             // 18: cloudprober.TargetStatus
-	nil,                              // 19: cloudprober.RunProbeResponse.ResultsEntry
-	nil,                              // 20: cloudprober.LogEntry.AttributesEntry
-	(*proto.ProbeDef)(nil),           // 21: cloudprober.probes.ProbeDef
-	(*proto1.Endpoint)(nil),          // 22: cloudprober.targets.Endpoint
+	(*ReloadConfigRequest)(nil),      // 14: cloudprober.ReloadConfigRequest
+	(*ReloadConfigResponse)(nil),     // 15: cloudprober.ReloadConfigResponse
+	(*GetProbeStatusRequest)(nil),    // 16: cloudprober.GetProbeStatusRequest
+	(*GetProbeStatusResponse)(nil),   // 17: cloudprober.GetProbeStatusResponse
+	(*LogEntry)(nil),                 // 18: cloudprober.LogEntry
+	(*ProbeStatus)(nil),              // 19: cloudprober.ProbeStatus
+	(*TargetStatus)(nil),             // 20: cloudprober.TargetStatus
+	nil,                              // 21: cloudprober.RunProbeResponse.ResultsEntry
+	nil,                              // 22: cloudprober.LogEntry.AttributesEntry
+	(*proto.ProbeDef)(nil),           // 23: cloudprober.probes.ProbeDef
+	(*proto1.Endpoint)(nil),          // 24: cloudprober.targets.Endpoint
 }
 var file_github_com_cloudprober_cloudprober_prober_proto_service_proto_depIdxs = []int32{
-	21, // 0: cloudprober.AddProbeRequest.probe_config:type_name -> cloudprober.probes.ProbeDef
-	22, // 1: cloudprober.ProbeRunResult.target:type_name -> cloudprober.targets.Endpoint
+	23, // 0: cloudprober.AddProbeRequest.probe_config:type_name -> cloudprober.probes.ProbeDef
+	24, // 1: cloudprober.ProbeRunResult.target:type_name -> cloudprober.targets.Endpoint
 	5,  // 2: cloudprober.ProbeRunResult.result_metrics:type_name -> cloudprober.ResultMetric
 	6,  // 3: cloudprober.ProbeResults.run_result:type_name -> cloudprober.ProbeRunResult
-	19, // 4: cloudprober.RunProbeResponse.results:type_name -> cloudprober.RunProbeResponse.ResultsEntry
-	21, // 5: cloudprober.Probe.config:type_name -> cloudprober.probes.ProbeDef
+	21, // 4: cloudprober.RunProbeResponse.results:type_name -> cloudprober.RunProbeResponse.ResultsEntry
+	23, // 5: cloudprober.Probe.config:type_name -> cloudprober.probes.ProbeDef
 	10, // 6: cloudprober.ListProbesResponse.probe:type_name -> cloudprober.Probe
-	17, // 7: cloudprober.GetProbeStatusResponse.probe_status:type_name -> cloudprober.ProbeStatus
-	20, // 8: cloudprober.LogEntry.attributes:type_name -> cloudprober.LogEntry.AttributesEntry
-	18, // 9: cloudprober.ProbeStatus.target_status:type_name -> cloudprober.TargetStatus
-	16, // 10: cloudprober.ProbeStatus.logs:type_name -> cloudprober.LogEntry
+	19, // 7: cloudprober.GetProbeStatusResponse.probe_status:type_name -> cloudprober.ProbeStatus
+	22, // 8: cloudprober.LogEntry.attributes:type_name -> cloudprober.LogEntry.AttributesEntry
+	20, // 9: cloudprober.ProbeStatus.target_status:type_name -> cloudprober.TargetStatus
+	18, // 10: cloudprober.ProbeStatus.logs:type_name -> cloudprober.LogEntry
 	7,  // 11: cloudprober.RunProbeResponse.ResultsEntry.value:type_name -> cloudprober.ProbeResults
 	0,  // 12: cloudprober.Cloudprober.AddProbe:input_type -> cloudprober.AddProbeRequest
 	2,  // 13: cloudprober.Cloudprober.RemoveProbe:input_type -> cloudprober.RemoveProbeRequest
 	4,  // 14: cloudprober.Cloudprober.RunProbe:input_type -> cloudprober.RunProbeRequest
 	9,  // 15: cloudprober.Cloudprober.ListProbes:input_type -> cloudprober.ListProbesRequest
 	12, // 16: cloudprober.Cloudprober.SaveProbesConfig:input_type -> cloudprober.SaveProbesConfigRequest
-	14, // 17: cloudprober.Cloudprober.GetProbeStatus:input_type -> cloudprober.GetProbeStatusRequest
-	1,  // 18: cloudprober.Cloudprober.AddProbe:output_type -> cloudprober.AddProbeResponse
-	3,  // 19: cloudprober.Cloudprober.RemoveProbe:output_type -> cloudprober.RemoveProbeResponse
-	8,  // 20: cloudprober.Cloudprober.RunProbe:output_type -> cloudprober.RunProbeResponse
-	11, // 21: cloudprober.Cloudprober.ListProbes:output_type -> cloudprober.ListProbesResponse
-	13, // 22: cloudprober.Cloudprober.SaveProbesConfig:output_type -> cloudprober.SaveProbesConfigResponse
-	15, // 23: cloudprober.Cloudprober.GetProbeStatus:output_type -> cloudprober.GetProbeStatusResponse
-	18, // [18:24] is the sub-list for method output_type
-	12, // [12:18] is the sub-list for method input_type
+	14, // 17: cloudprober.Cloudprober.ReloadConfig:input_type -> cloudprober.ReloadConfigRequest
+	16, // 18: cloudprober.Cloudprober.GetProbeStatus:input_type -> cloudprober.GetProbeStatusRequest
+	1,  // 19: cloudprober.Cloudprober.AddProbe:output_type -> cloudprober.AddProbeResponse
+	3,  // 20: cloudprober.Cloudprober.RemoveProbe:output_type -> cloudprober.RemoveProbeResponse
+	8,  // 21: cloudprober.Cloudprober.RunProbe:output_type -> cloudprober.RunProbeResponse
+	11, // 22: cloudprober.Cloudprober.ListProbes:output_type -> cloudprober.ListProbesResponse
+	13, // 23: cloudprober.Cloudprober.SaveProbesConfig:output_type -> cloudprober.SaveProbesConfigResponse
+	15, // 24: cloudprober.Cloudprober.ReloadConfig:output_type -> cloudprober.ReloadConfigResponse
+	17, // 25: cloudprober.Cloudprober.GetProbeStatus:output_type -> cloudprober.GetProbeStatusResponse
+	19, // [19:26] is the sub-list for method output_type
+	12, // [12:19] is the sub-list for method input_type
 	12, // [12:12] is the sub-list for extension type_name
 	12, // [12:12] is the sub-list for extension extendee
 	0,  // [0:12] is the sub-list for field type_name
@@ -1145,7 +1224,7 @@ func file_github_com_cloudprober_cloudprober_prober_proto_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDesc), len(file_github_com_cloudprober_cloudprober_prober_proto_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

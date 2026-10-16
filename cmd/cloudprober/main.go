@@ -162,26 +162,24 @@ func main() {
 
 	startCtx := context.Background()
 
-	if *stopTime == 0 {
-		*stopTime = time.Duration(cloudprober.GetConfig().GetStopTimeSec()) * time.Second
-	}
-
-	if *stopTime != 0 {
-		// Set up signal handling for the cancelation of the start context.
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		ctx, cancelF := context.WithCancel(startCtx)
-		startCtx = ctx
-
-		go func() {
-			sig := <-sigs
-			l.Warningf("Received signal \"%v\", canceling the start context and waiting for %v before closing", sig, *stopTime)
-			cancelF()
-			time.Sleep(*stopTime)
-			logger.WaitForStderr(time.Second)
-			os.Exit(0)
-		}()
-	}
+	// Read config-derived shutdown delay when the signal arrives, so a reload
+	// can change stop_time_sec. An explicit command-line delay still wins.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancelF := context.WithCancel(startCtx)
+	startCtx = ctx
+	go func() {
+		sig := <-sigs
+		delay := *stopTime
+		if delay == 0 {
+			delay = time.Duration(cloudprober.GetConfig().GetStopTimeSec()) * time.Second
+		}
+		l.Warningf("Received signal \"%v\", canceling the start context and waiting for %v before closing", sig, delay)
+		cancelF()
+		time.Sleep(delay)
+		logger.WaitForStderr(time.Second)
+		os.Exit(0)
+	}()
 
 	if *runOnce {
 		err := cloudprober.RunOnce(startCtx, *runOnceProbeNames, *runOnceOutFormat, *runOnceOutIndent)

@@ -217,6 +217,9 @@ func buildOptions(sdef *surfacerpb.SurfacerDef, ignoreInit bool, l *logger.Logge
 
 // BuildOptionsFromConfig builds surfacer options using config.
 func BuildOptionsFromConfig(sdef *surfacerpb.SurfacerDef, l *logger.Logger) (*Options, error) {
+	if sdef.GetMetricsBufferSize() < 0 {
+		return nil, fmt.Errorf("metrics_buffer_size cannot be negative")
+	}
 	return buildOptions(sdef, false, l)
 }
 

@@ -51,8 +51,10 @@ const (
 // for making StackDriver API calls, and a registered which is in charge of
 // keeping track of what metrics have already been registereded
 type SDSurfacer struct {
-	c    *configpb.SurfacerConf
-	opts *options.Options
+	cancel context.CancelFunc
+	done   chan struct{}
+	c      *configpb.SurfacerConf
+	opts   *options.Options
 
 	// Metrics regexp
 	allowedMetricsRegex *regexp.Regexp
@@ -89,6 +91,9 @@ type SDSurfacer struct {
 // as provisioning it with clients for making the necessary API calls. New
 // requires you to pass in a valid stackdriver surfacer configuration.
 func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Options, httpClient *http.Client, l *logger.Logger) (*SDSurfacer, error) {
+	if config.GetBatchTimerSec() == 0 || config.GetBatchTimerSec() > uint64(time.Duration(1<<63-1)/time.Second) || config.GetMetricsBufferSize() < 0 {
+		return nil, fmt.Errorf("invalid stackdriver surfacer buffer, batch size, or export interval")
+	}
 	// Create a cache, which is used for batching write requests together,
 	// and a channel for writing data.
 	s := SDSurfacer{
@@ -149,10 +154,26 @@ func New(ctx context.Context, config *configpb.SurfacerConf, opts *options.Optio
 
 	// Start either the writeAsync or the writeBatch, depending on if we are
 	// batching or not.
-	go s.writeBatch(ctx)
+	ctx, s.cancel = context.WithCancel(ctx)
+	s.done = make(chan struct{})
+	go func() {
+		defer close(s.done)
+		s.writeBatch(ctx)
+	}()
 
 	s.l.Info("Created a new stackdriver surfacer")
 	return &s, nil
+}
+
+// Close stops the exporter and waits for in-flight writes to finish.
+func (s *SDSurfacer) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.done != nil {
+		<-s.done
+	}
+	return nil
 }
 
 // Write queues a message to be written to stackdriver.
@@ -171,7 +192,7 @@ func (s *SDSurfacer) Write(_ context.Context, em *metrics.EventMetrics) {
 // We create metric descriptors explicitly, instead of relying on auto-
 // creation by creating timeseries, because auto-creation doesn't add units to
 // the metric.
-func (s *SDSurfacer) createMetricDescriptor(ts *monitoring.TimeSeries) error {
+func (s *SDSurfacer) createMetricDescriptor(ctx context.Context, ts *monitoring.TimeSeries) error {
 	var labels []*monitoring.LabelDescriptor
 	for k := range ts.Metric.Labels {
 		labels = append(labels, &monitoring.LabelDescriptor{
@@ -187,7 +208,7 @@ func (s *SDSurfacer) createMetricDescriptor(ts *monitoring.TimeSeries) error {
 		Labels:     labels,
 		Unit:       ts.Unit,
 		ValueType:  ts.ValueType,
-	}).Do()
+	}).Context(ctx).Do()
 
 	return err
 }
@@ -206,7 +227,13 @@ func (s *SDSurfacer) writeBatch(ctx context.Context) {
 	// Introduce a random delay before starting the loop.
 	rand.Seed(time.Now().UnixNano())
 	randomDelay := time.Duration(rand.Int63n(int64(s.c.GetBatchTimerSec()))) * time.Second
-	time.Sleep(randomDelay)
+	delay := time.NewTimer(randomDelay)
+	defer delay.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-delay.C:
+	}
 
 	batchTicker := time.NewTicker(time.Duration(s.c.GetBatchTimerSec()) * time.Second)
 	for {
@@ -229,7 +256,7 @@ func (s *SDSurfacer) writeBatch(ctx context.Context) {
 			var ts []*monitoring.TimeSeries
 			for _, v := range s.cache {
 				if !s.knownMetrics[v.Metric.Type] && v.Unit != "" {
-					if err := s.createMetricDescriptor(v); err != nil {
+					if err := s.createMetricDescriptor(ctx, v); err != nil {
 						s.l.Warningf("Error creating metric descriptor for: %s, err: %v", v.Metric.Type, err)
 						continue
 					}
@@ -252,7 +279,7 @@ func (s *SDSurfacer) writeBatch(ctx context.Context) {
 				requestBody := monitoring.CreateTimeSeriesRequest{
 					TimeSeries: ts[i:endIndex],
 				}
-				if _, err := s.client.Projects.TimeSeries.Create("projects/"+s.projectName, &requestBody).Do(); err != nil {
+				if _, err := s.client.Projects.TimeSeries.Create("projects/"+s.projectName, &requestBody).Context(ctx).Do(); err != nil {
 					s.failCnt++
 					s.l.Warningf("Unable to fulfill TimeSeries Create call. Err: %v", err)
 				}

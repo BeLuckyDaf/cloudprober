@@ -15,6 +15,7 @@
 package kubernetes
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/cloudprober/cloudprober/common/oauth"
 	"github.com/cloudprober/cloudprober/common/tlsconfig"
 	configpb "github.com/cloudprober/cloudprober/internal/rds/kubernetes/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/lifecycle"
 	"github.com/cloudprober/cloudprober/logger"
 	"golang.org/x/oauth2"
 )
@@ -45,6 +47,7 @@ const apiCallTimeout = 30 * time.Second
 
 // client encapsulates an in-cluster kubeapi client.
 type client struct {
+	ctx     context.Context
 	cfg     *configpb.ProviderConfig
 	httpC   *http.Client
 	apiHost string
@@ -54,7 +57,7 @@ type client struct {
 
 func (c *client) httpRequest(url string) (*http.Request, error) {
 	url = fmt.Sprintf("https://%s/%s", c.apiHost, strings.TrimPrefix(url, "/"))
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(lifecycle.Context(c.ctx), "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}

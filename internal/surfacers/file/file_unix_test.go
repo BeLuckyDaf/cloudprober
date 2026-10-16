@@ -88,10 +88,12 @@ func TestWriteChannelFull(t *testing.T) {
 	// This write should fail as the channel is full.
 	s.Write(ctx, em)
 
+	close(doneCh)
+	wg.Wait()
+	s.close() // Finish background log writes before reading the captured buffer.
+
 	if !strings.Contains(buf.String(), "write channel is full") {
 		t.Errorf("Expected log on write channel full. Got: %s", buf.String())
 	}
 
-	close(doneCh)
-	wg.Wait()
 }

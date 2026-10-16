@@ -165,3 +165,12 @@ var globalState = &state{
 func StatusHTML() (string, error) {
 	return globalState.statusHTML()
 }
+
+// ResetStatus drops alert state from a retired runtime. Callers must stop its
+// probes before resetting so they cannot publish alerts into the new runtime.
+func ResetStatus() {
+	globalState.mu.Lock()
+	defer globalState.mu.Unlock()
+	globalState.currentAlerts = make(map[string]*alertinfo.AlertInfo)
+	globalState.resolvedAlerts = nil
+}

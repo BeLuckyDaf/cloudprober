@@ -15,6 +15,7 @@
 package kubernetes
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -268,5 +269,30 @@ func TestNewRejectsNonPositiveReEvalSec(t *testing.T) {
 			ReEvalSec: proto.Int32(reEvalSec),
 		}, nil)
 		assert.ErrorContains(t, err, "re_eval_sec", "re_eval_sec=%d", reEvalSec)
+	}
+}
+
+func TestRuntimeCancellationStopsAPIRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	kc := testK8sClient(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(stopped)
+	})
+	kc.ctx = ctx
+	newPodsLister("", time.Hour, kc, nil)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial API request did not start")
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("API request did not stop on runtime cancellation")
 	}
 }

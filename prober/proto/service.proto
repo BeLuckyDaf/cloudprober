@@ -24,6 +24,10 @@ service Cloudprober {
 
   rpc SaveProbesConfig(SaveProbesConfigRequest) returns (SaveProbesConfigResponse) {}
 
+  // ReloadConfig rereads the original config source and applies the updated
+  // configuration without restarting the process.
+  rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse) {}
+
   // GetProbeStatus returns the ongoing probe status data, including
   // total/success counters per probe/target.
   rpc GetProbeStatus(GetProbeStatusRequest) returns (GetProbeStatusResponse) {}
@@ -99,6 +103,10 @@ message SaveProbesConfigRequest {
 message SaveProbesConfigResponse {
   optional string file_path = 1;
 }
+
+message ReloadConfigRequest {}
+
+message ReloadConfigResponse {}
 
 message GetProbeStatusRequest {
   // If empty, status for all probes is returned.
